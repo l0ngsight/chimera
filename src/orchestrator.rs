@@ -351,9 +351,11 @@ impl Orchestrator {
 
         // Decide whether to continue a native CLI session or replay history in the prompt.
         let (native_session, resume) = match spec.as_ref().map(|s| (s.session, s.resume_args.is_some())) {
-            Some((SessionMode::Preassign, has_resume)) => match &agent.native_session {
-                Some(id) if has_resume => (Some(id.clone()), true),
-                _ => (Some(uuid::Uuid::new_v4().to_string()), false),
+            // Reuse the id once the CLI has a session. Runtimes without `resume_args` (e.g. pi's
+            // `--session-id`, which creates or continues) keep using `args` with the same id.
+            Some((SessionMode::Preassign, _)) => match &agent.native_session {
+                Some(id) => (Some(id.clone()), true),
+                None => (Some(uuid::Uuid::new_v4().to_string()), false),
             },
             Some((SessionMode::Capture, true)) => (agent.native_session.clone(), agent.native_session.is_some()),
             _ => (None, false),

@@ -28,6 +28,7 @@ pub struct DecisionsConfig {
     pub base_url: String,
     pub model: String,
     /// Environment variable with the API key (falls back to the variables in `FALLBACK_KEY_ENVS`).
+    /// Empty for servers that need no key, such as a local Ollama.
     pub api_key_env: String,
     pub timeout_ms: u64,
     /// Do not start a turn for messages that are only acknowledgements.
@@ -71,16 +72,25 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const FALLBACK_KEY_ENVS: &[&str] = &["JEV_API_KEY", "OPENROUTER_API_KEY", "TYPESAFE_API_KEY"];
 
 impl DecisionsConfig {
-    /// The API key and the variable it came from.
+    /// No key is configured on purpose (local servers such as Ollama).
+    pub fn keyless(&self) -> bool {
+        self.api_key_env.trim().is_empty()
+    }
+
+    /// The API key and the variable it came from. Keyless configurations never pick up a
+    /// fallback key, so a cloud key is not sent to a local server.
     pub fn api_key(&self) -> Option<(String, String)> {
+        if self.keyless() {
+            return None;
+        }
         std::iter::once(self.api_key_env.as_str())
             .chain(FALLBACK_KEY_ENVS.iter().copied())
             .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()).map(|v| (v, var.to_string())))
     }
 
-    /// Enabled and an API key is available.
+    /// Enabled, and either keyless or a key is available.
     pub fn active(&self) -> bool {
-        self.enabled && self.api_key().is_some()
+        self.enabled && (self.keyless() || self.api_key().is_some())
     }
 }
 
@@ -170,13 +180,18 @@ impl Jev {
 
     /// Sends one request with a single question and returns its answer.
     async fn ask(&self, cfg: &DecisionsConfig, state: Value, question: Question) -> anyhow::Result<(Answer, CallInfo)> {
-        let (key, _) = cfg.api_key().context("no Jev API key configured")?;
+        let key = match cfg.api_key() {
+            Some((key, _)) => Some(key),
+            None if cfg.keyless() => None,
+            None => bail!("no Jev API key configured"),
+        };
         let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
         let started = Instant::now();
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(key)
+        let mut req = self.http.post(&url);
+        if let Some(key) = key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
             .timeout(Duration::from_millis(cfg.timeout_ms.max(100)))
             .json(&json!({ "model": cfg.model, "state": state, "questions": { "q": question } }))
             .send()
@@ -380,6 +395,23 @@ mod tests {
         .unwrap();
         assert!(matches!(r.answers["a"], Answer::Noul { noul } if noul == 0.95));
         assert!(matches!(&r.answers["b"], Answer::Choice { choice, .. } if choice == "billing"));
+    }
+
+    #[test]
+    fn keyless_config_is_active_and_never_borrows_a_cloud_key() {
+        // SAFETY: test-only variable with a unique name.
+        unsafe { std::env::set_var("JEV_API_KEY", "cloud-key-must-not-leak") };
+        let local = DecisionsConfig {
+            base_url: "http://localhost:11434/v1".into(),
+            model: "nimble".into(),
+            api_key_env: String::new(),
+            ..Default::default()
+        };
+        assert!(local.keyless());
+        assert!(local.active());
+        assert!(local.api_key().is_none(), "a local server must not receive the cloud key");
+        let cloud = DecisionsConfig::default();
+        assert_eq!(cloud.api_key().map(|(_, var)| var).as_deref(), Some("JEV_API_KEY"));
     }
 
     #[test]

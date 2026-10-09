@@ -165,6 +165,8 @@ pub enum OutputFormat {
     CodexJson,
     /// `opencode run --format json`.
     OpencodeJson,
+    /// `pi -p --mode json` (JSONL session events).
+    PiJson,
 }
 
 /// How to discover the models a runtime can use.
@@ -202,6 +204,8 @@ pub enum ModelsFormat {
     CodexCatalog,
     /// `opencode models --verbose`.
     OpencodeVerbose,
+    /// `pi --list-models` (table: provider, model, context, max-out, thinking, images).
+    PiTable,
 }
 
 fn one(s: &str) -> ArgItem {
@@ -354,6 +358,33 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             guard: true,
             models_source: ModelsSource::Static,
             models: vec!["anthropic/claude-opus-5-5".into(), "nousresearch/hermes-4-405b".into()],
+        },
+    );
+    m.insert(
+        "pi".into(),
+        RuntimeSpec {
+            label: "pi coding agent".into(),
+            kind: RuntimeKind::Process,
+            command: "pi".into(),
+            // Prompt on stdin. The same --session-id creates the session on the first turn and
+            // continues it afterwards, so no separate resume arguments are needed.
+            args: vec![
+                one("-p"),
+                one("--mode"),
+                one("json"),
+                group(&["--model", "{model}"]),
+                group(&["--thinking", "{effort}"]),
+                group(&["--session-id", "{native_session}"]),
+            ],
+            resume_args: None,
+            session: SessionMode::Preassign,
+            output: OutputFormat::PiJson,
+            effort_map: BTreeMap::from([("ultra".into(), "max".into())]),
+            env: BTreeMap::new(),
+            timeout_secs: default_timeout(),
+            guard: true,
+            models_source: ModelsSource::Command { args: vec!["--list-models".into()], format: ModelsFormat::PiTable },
+            models: vec!["anthropic/claude-sonnet-5-5".into(), "openai/gpt-5.5".into()],
         },
     );
     m.insert(

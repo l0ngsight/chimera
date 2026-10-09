@@ -257,11 +257,13 @@ pub struct OutputParser {
     last_message: String,
     native_session: Option<String>,
     error: Option<String>,
+    /// Accumulated cost reported by the runtime (USD), when it reports one per message.
+    cost: f64,
 }
 
 impl OutputParser {
     pub fn new(format: OutputFormat) -> Self {
-        Self { format, text: String::new(), last_message: String::new(), native_session: None, error: None }
+        Self { format, text: String::new(), last_message: String::new(), native_session: None, error: None, cost: 0.0 }
     }
 
     pub fn feed(&mut self, line: &str) -> Vec<LogLine> {
@@ -280,6 +282,7 @@ impl OutputParser {
             OutputFormat::ClaudeStreamJson => self.feed_claude(&v),
             OutputFormat::CodexJson => self.feed_codex(&v),
             OutputFormat::OpencodeJson => self.feed_opencode(&v),
+            OutputFormat::PiJson => self.feed_pi(&v),
             OutputFormat::Text => unreachable!(),
         }
     }
@@ -416,6 +419,77 @@ impl OutputParser {
                 let msg = v["error"]["message"].as_str().or(v["message"].as_str()).unwrap_or("codex error");
                 self.error = Some(msg.to_string());
                 out.push(LogLine::new(LogKind::Error, msg));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// pi `--mode json`: completed messages arrive in `message_end`, tool runs in
+    /// `tool_execution_*`; streaming `message_update` deltas are skipped.
+    fn feed_pi(&mut self, v: &Value) -> Vec<LogLine> {
+        let mut out = vec![];
+        match v["type"].as_str().unwrap_or_default() {
+            "session" => {
+                if let Some(id) = v["id"].as_str() {
+                    self.native_session = Some(id.to_string());
+                }
+                out.push(LogLine::new(LogKind::Info, "session started"));
+            }
+            "message_end" if v["message"]["role"] == "assistant" => {
+                let m = &v["message"];
+                let mut text = vec![];
+                for c in m["content"].as_array().into_iter().flatten() {
+                    match c["type"].as_str().unwrap_or_default() {
+                        "text" => text.push(c["text"].as_str().unwrap_or_default().to_string()),
+                        "thinking" => {
+                            let t = c["thinking"].as_str().unwrap_or_default();
+                            if !t.is_empty() {
+                                out.push(LogLine::new(LogKind::Thinking, t));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let text = text.join("\n");
+                if !text.trim().is_empty() {
+                    out.push(LogLine::new(LogKind::Text, text.clone()));
+                    self.last_message = text;
+                }
+                self.cost += m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0);
+                if m["stopReason"] == "error" {
+                    let msg = m["errorMessage"].as_str().unwrap_or("pi reported an error").to_string();
+                    out.push(LogLine::new(LogKind::Error, msg.clone()));
+                    self.error = Some(msg);
+                }
+            }
+            "tool_execution_start" => out.push(LogLine::new(
+                LogKind::Tool,
+                format!("{} {}", v["toolName"].as_str().unwrap_or("tool"), summarize_json(&v["args"])),
+            )),
+            "tool_execution_end" => {
+                let body: Vec<&str> = v["result"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| c["text"].as_str())
+                    .collect();
+                let kind = if v["isError"] == true { LogKind::Error } else { LogKind::ToolResult };
+                out.push(LogLine::new(kind, truncate(&body.join("\n"), 2000)));
+            }
+            "auto_retry_start" => out.push(LogLine::new(
+                LogKind::Info,
+                format!("retrying ({})", v["errorMessage"].as_str().unwrap_or("provider error")),
+            )),
+            "auto_retry_end" if v["success"] == false => {
+                let msg = v["finalError"].as_str().unwrap_or("pi gave up after retries").to_string();
+                out.push(LogLine::new(LogKind::Error, msg.clone()));
+                self.error = Some(msg);
+            }
+            "agent_settled" => {
+                let cost = if self.cost > 0.0 { format!(", cost ${:.4}", self.cost) } else { String::new() };
+                let how = if v["aborted"] == true { "aborted" } else { "finished" };
+                out.push(LogLine::new(LogKind::Info, format!("{how}{cost}")));
             }
             _ => {}
         }
@@ -604,6 +678,30 @@ mod tests {
         let out = p.finish();
         assert_eq!(out.text, "all done");
         assert_eq!(out.native_session.as_deref(), Some("s1"));
+    }
+
+    /// Real `pi -p --mode json` output: a bash tool call, its result, then the final answer.
+    #[test]
+    fn parses_pi_json() {
+        let mut p = OutputParser::new(OutputFormat::PiJson);
+        let mut lines = vec![];
+        for l in include_str!("../testdata/pi-json.jsonl").lines() {
+            lines.extend(p.feed(l));
+        }
+        assert!(lines.iter().any(|l| l.kind == LogKind::Tool && l.text == "bash echo tool-ran-ok"));
+        assert!(lines.iter().any(|l| l.kind == LogKind::ToolResult && l.text.trim() == "tool-ran-ok"));
+        assert!(lines.iter().any(|l| l.kind == LogKind::Info && l.text.starts_with("finished")));
+        let out = p.finish();
+        assert_eq!(out.text, "Done. <message to=\"lead\">result ready</message>");
+        assert_eq!(out.native_session.as_deref(), Some("bc66e7da-dfaa-4677-852a-1535c50f75fe"));
+        assert!(out.error.is_none());
+    }
+
+    #[test]
+    fn pi_errors_are_reported() {
+        let mut p = OutputParser::new(OutputFormat::PiJson);
+        p.feed(r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401 invalid key"}}"#);
+        assert_eq!(p.finish().error.as_deref(), Some("401 invalid key"));
     }
 
     #[test]

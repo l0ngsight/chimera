@@ -332,7 +332,7 @@ function createGraph(wrap, team, opts = {}) {
 function ellipsize(s, n) { s = s || ''; return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
 function runtimeColor(rt) {
-  return { claude: '#d97757', codex: '#10a37f', opencode: '#a78bfa', hermes: '#f5c542', mock: '#64748b' }[rt] || '#7c9cff';
+  return { claude: '#d97757', codex: '#10a37f', opencode: '#a78bfa', hermes: '#f5c542', pi: '#38bdf8', mock: '#64748b' }[rt] || '#7c9cff';
 }
 
 // ---------------------------------------------------------------- sessions list
@@ -1046,8 +1046,10 @@ const PRESETS = {
 };
 
 const JEV_PROVIDERS = {
-  OpenRouter: { base_url: 'https://openrouter.ai/api/v1', api_key_env: 'JEV_API_KEY' },
-  'TypeSafe direct': { base_url: 'https://api.typesafe.ai/v1', api_key_env: 'TYPESAFE_API_KEY' },
+  OpenRouter: { base_url: 'https://openrouter.ai/api/v1', model: 'jev-latest', api_key_env: 'JEV_API_KEY', timeout_ms: 5000 },
+  'TypeSafe direct': { base_url: 'https://api.typesafe.ai/v1', model: 'jev-latest', api_key_env: 'TYPESAFE_API_KEY', timeout_ms: 5000 },
+  // Ollama 0.35+ serves the same System One API locally; no key. Local models need longer for the first (cold) call.
+  'Ollama (local)': { base_url: 'http://localhost:11434/v1', model: 'nimble', api_key_env: '', timeout_ms: 30000 },
 };
 
 /** The OS sandbox that stops agents from killing or quitting the user's programs. */
@@ -1099,7 +1101,7 @@ function jevCard(settings) {
   const showStatus = s => {
     status.className = 'small ' + (s.decisions_active ? 'muted' : 'avail no');
     status.textContent = s.decisions_active
-      ? `✔ active, key read from $${s.decisions_key_env}`
+      ? (s.decisions.api_key_env.trim() ? `✔ active, key read from $${s.decisions_key_env}` : '✔ active, no API key (local server)')
       : !s.decisions.enabled ? '✖ disabled' : `✖ no API key: set $${s.decisions.api_key_env} (or JEV_API_KEY / OPENROUTER_API_KEY / TYPESAFE_API_KEY) for the server`;
   };
   showStatus(settings);
@@ -1131,12 +1133,12 @@ function jevCard(settings) {
     status,
     h('div', { class: 'row', style: 'margin-top:10px' }, h('span', { class: 'muted small' }, 'Provider:'),
       Object.entries(JEV_PROVIDERS).map(([name, p]) => h('button', {
-        onclick: () => { f.base_url.value = p.base_url; f.api_key_env.value = p.api_key_env; },
+        onclick: () => { for (const k of ['base_url', 'model', 'api_key_env', 'timeout_ms']) f[k].value = p[k]; },
       }, name))),
     h('div', { class: 'grid', style: 'grid-template-columns: 2fr 1fr 1fr 120px; gap: 0 10px' },
       h('div', {}, h('label', {}, 'Base URL'), f.base_url),
       h('div', {}, h('label', {}, 'Model'), f.model),
-      h('div', {}, h('label', {}, 'API key environment variable'), f.api_key_env),
+      h('div', {}, h('label', {}, 'API key env var (empty = no key)'), f.api_key_env),
       h('div', {}, h('label', {}, 'Timeout (ms)'), f.timeout_ms)),
     h('div', { style: 'margin-top:12px' },
       toggle(f.ack_filter, 'Don’t wake a persona for pure acknowledgements (“thanks”, “sounds good”); they are read on its next turn', f.ack_min_confidence, 'min confidence'),

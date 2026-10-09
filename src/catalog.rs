@@ -205,6 +205,7 @@ pub fn parse(format: ModelsFormat, out: &str) -> anyhow::Result<Vec<ModelInfo>> 
         ModelsFormat::Lines => parse_lines(out),
         ModelsFormat::CodexCatalog => parse_codex(out)?,
         ModelsFormat::OpencodeVerbose => parse_opencode_verbose(out),
+        ModelsFormat::PiTable => parse_pi_table(out),
     })
 }
 
@@ -281,6 +282,36 @@ fn parse_opencode_verbose(out: &str) -> Vec<ModelInfo> {
     models
 }
 
+/// `pi --list-models`: a header row, then `provider model context max-out thinking images`.
+fn parse_pi_table(out: &str) -> Vec<ModelInfo> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("provider "))
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            let [provider, model, context, ..] = cols.as_slice() else { return None };
+            Some(ModelInfo {
+                id: format!("{provider}/{model}"),
+                name: None,
+                description: None,
+                efforts: vec![],
+                default_effort: None,
+                context: parse_size(context),
+                group: Some(provider.to_string()),
+            })
+        })
+        .collect()
+}
+
+/// "1M", "300K", "65.5K", "128000" → tokens.
+fn parse_size(s: &str) -> Option<u64> {
+    let (num, mult) = match s.chars().last()? {
+        'K' | 'k' => (&s[..s.len() - 1], 1_000.0),
+        'M' | 'm' => (&s[..s.len() - 1], 1_000_000.0),
+        _ => (s, 1.0),
+    };
+    num.parse::<f64>().ok().map(|n| (n * mult).round() as u64)
+}
+
 /// One page of `GET /v1/models`.
 fn parse_anthropic_page(body: &Value) -> Vec<ModelInfo> {
     body["data"]
@@ -351,6 +382,17 @@ mod tests {
     fn opencode_plain_output_still_parses() {
         let models = parse(ModelsFormat::OpencodeVerbose, "a/x\nb/y\n").unwrap();
         assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a/x", "b/y"]);
+    }
+
+    #[test]
+    fn parses_pi_model_table() {
+        let models = parse(ModelsFormat::PiTable, include_str!("../testdata/pi-list-models.txt")).unwrap();
+        assert_eq!(models.len(), 4);
+        assert_eq!(models[0].id, "amazon-bedrock/amazon.nova-2-lite-v1:0");
+        assert_eq!(models[0].context, Some(1_000_000));
+        assert_eq!(models[0].group.as_deref(), Some("amazon-bedrock"));
+        assert_eq!(models[3].id, "fake/fake-1");
+        assert_eq!(models[3].context, Some(128_000));
     }
 
     #[test]
