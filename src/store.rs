@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::PromptLlmConfig;
+use crate::decisions::DecisionsConfig;
 use crate::model::Team;
 
 /// Teams shipped with chimera, written to the data dir on first start.
@@ -86,24 +89,61 @@ pub struct SettingsStore {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    pub prompt_llm: PromptLlmConfig,
+    /// `None` when written by a version without Jev support.
+    #[serde(default)]
+    pub decisions: Option<DecisionsConfig>,
+}
+
+/// Accepts the current format and the original one (a bare `PromptLlmConfig`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredSettings {
+    Current(Settings),
+    Legacy(PromptLlmConfig),
+}
+
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
-    pub fn load(&self) -> Option<PromptLlmConfig> {
+    pub fn load(&self) -> Option<Settings> {
         let text = std::fs::read_to_string(&self.path).ok()?;
-        serde_yaml::from_str(&text).ok()
+        match serde_yaml::from_str(&text) {
+            Ok(StoredSettings::Current(s)) => Some(s),
+            Ok(StoredSettings::Legacy(prompt_llm)) => Some(Settings { prompt_llm, decisions: None }),
+            Err(e) => {
+                tracing::warn!("ignoring unreadable {}: {e}", self.path.display());
+                None
+            }
+        }
     }
 
-    pub fn save(&self, cfg: &PromptLlmConfig) -> anyhow::Result<()> {
-        std::fs::write(&self.path, serde_yaml::to_string(cfg)?)?;
+    pub fn save(&self, settings: &Settings) -> anyhow::Result<()> {
+        std::fs::write(&self.path, serde_yaml::to_string(settings)?)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loads_legacy_and_current_settings() {
+        let dir = std::env::temp_dir().join(format!("chimera-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = super::SettingsStore::new(dir.join("settings.yaml"));
+        std::fs::write(dir.join("settings.yaml"), "api: openai\nbase_url: http://x\nmodel: m\napi_key_env: K\n")
+            .unwrap();
+        let s = store.load().unwrap();
+        assert_eq!(s.prompt_llm.model, "m");
+        assert!(s.decisions.is_none());
+        store.save(&super::Settings { prompt_llm: s.prompt_llm, decisions: Some(Default::default()) }).unwrap();
+        assert_eq!(store.load().unwrap().decisions.unwrap().model, "jev-latest");
+    }
+
     #[test]
     fn sample_teams_are_valid() {
         for (id, yaml) in super::SAMPLE_TEAMS {

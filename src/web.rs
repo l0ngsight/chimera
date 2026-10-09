@@ -18,11 +18,12 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config::{PromptLlmConfig, RuntimeSpec};
+use crate::decisions::DecisionsConfig;
 use crate::model::Team;
 use crate::orchestrator::{NewSession, Orchestrator};
 use crate::promptgen;
 use crate::session::Session;
-use crate::store::{SettingsStore, TeamStore};
+use crate::store::{Settings, SettingsStore, TeamStore};
 
 pub struct AppState {
     pub teams: TeamStore,
@@ -67,6 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/teams/{id}", get(get_team).put(update_team).delete(delete_team))
         .route("/api/personas/generate", post(generate_persona))
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/decisions/test", post(test_decisions))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", get(get_session).delete(delete_session))
         .route("/api/sessions/{id}/events", get(session_events))
@@ -172,24 +174,62 @@ async fn generate_persona(
 struct SettingsView {
     prompt_llm: PromptLlmConfig,
     api_key_present: bool,
+    decisions: DecisionsConfig,
+    /// Name of the environment variable the Jev key is read from (never the key itself).
+    decisions_key_env: Option<String>,
+    decisions_active: bool,
 }
 
 async fn get_settings(State(st): State<Arc<AppState>>) -> Json<SettingsView> {
     let cfg = st.prompt_llm.read().unwrap().clone();
     let api_key_present = std::env::var(&cfg.api_key_env).map(|v| !v.is_empty()).unwrap_or(false);
-    Json(SettingsView { prompt_llm: cfg, api_key_present })
+    let decisions = st.orchestrator.decisions.read().unwrap().clone();
+    Json(SettingsView {
+        prompt_llm: cfg,
+        api_key_present,
+        decisions_key_env: decisions.api_key().map(|(_, var)| var),
+        decisions_active: decisions.active(),
+        decisions,
+    })
+}
+
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    #[serde(default)]
+    prompt_llm: Option<PromptLlmConfig>,
+    #[serde(default)]
+    decisions: Option<DecisionsConfig>,
 }
 
 async fn put_settings(
     State(st): State<Arc<AppState>>,
-    Json(cfg): Json<PromptLlmConfig>,
+    Json(update): Json<SettingsUpdate>,
 ) -> AppResult<Json<SettingsView>> {
-    if cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() || cfg.api_key_env.trim().is_empty() {
+    if let Some(cfg) = &update.prompt_llm
+        && (cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() || cfg.api_key_env.trim().is_empty())
+    {
         return Err(ApiError::bad("base_url, model and api_key_env are required"));
     }
-    st.settings.save(&cfg)?;
-    *st.prompt_llm.write().unwrap() = cfg;
+    if let Some(d) = &update.decisions
+        && (d.base_url.trim().is_empty() || d.model.trim().is_empty())
+    {
+        return Err(ApiError::bad("Jev base_url and model are required"));
+    }
+    let settings = Settings {
+        prompt_llm: update.prompt_llm.unwrap_or_else(|| st.prompt_llm.read().unwrap().clone()),
+        decisions: Some(update.decisions.unwrap_or_else(|| st.orchestrator.decisions.read().unwrap().clone())),
+    };
+    st.settings.save(&settings)?;
+    *st.prompt_llm.write().unwrap() = settings.prompt_llm;
+    *st.orchestrator.decisions.write().unwrap() = settings.decisions.unwrap_or_default();
     Ok(get_settings(State(st)).await)
+}
+
+/// Sends a tiny request to Jev to check the configuration.
+async fn test_decisions(State(st): State<Arc<AppState>>) -> AppResult<Json<serde_json::Value>> {
+    let cfg = st.orchestrator.decisions.read().unwrap().clone();
+    let v = st.orchestrator.jev.ping(&cfg).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(json!({ "model": v.model, "latency_ms": v.latency_ms, "answer": v.value })))
 }
 
 async fn list_sessions(State(st): State<Arc<AppState>>) -> Json<Vec<crate::session::SessionSummary>> {
@@ -294,7 +334,14 @@ async fn post_message(
     Json(req): Json<PostMessage>,
 ) -> AppResult<StatusCode> {
     let session = find_session(&st, &id)?;
-    let to = req.to.filter(|t| !t.is_empty()).unwrap_or_else(|| session.lock().meta.team.entry.clone());
+    if req.content.trim().is_empty() {
+        return Err(ApiError::bad("message must not be empty"));
+    }
+    let to = match req.to.filter(|t| !t.is_empty()) {
+        Some(t) if t == "auto" => st.orchestrator.route_user_message(&session, &req.content).await,
+        Some(t) => t,
+        None => session.lock().meta.team.entry.clone(),
+    };
     st.orchestrator.post_message(&session, &to, &req.content).map_err(|e| ApiError::bad(format!("{e:#}")))?;
     Ok(StatusCode::ACCEPTED)
 }

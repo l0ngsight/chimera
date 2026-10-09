@@ -7,17 +7,19 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{RuntimeKind, RuntimeSpec, SessionMode};
+use crate::decisions::{DecisionsConfig, Jev, Verdict};
 use crate::model::{Persona, Team};
 use crate::runtime::{self, Invocation, LogLine, TurnOutput, truncate};
 use crate::session::{
-    AgentState, AgentStatus, EventBody, HistoryEntry, InboxMessage, Inner, LogKind, Session, SessionMeta, SessionStatus,
+    AgentState, AgentStatus, DecisionKind, EventBody, HistoryEntry, InboxMessage, Inner, LogKind, Session, SessionMeta,
+    SessionStatus,
 };
 
 pub const USER: &str = "user";
@@ -26,6 +28,24 @@ pub struct Orchestrator {
     pub runtimes: BTreeMap<String, RuntimeSpec>,
     pub sessions_dir: PathBuf,
     pub workspaces_dir: PathBuf,
+    /// Quick decisions with Jev (editable at runtime from the settings page).
+    pub decisions: RwLock<DecisionsConfig>,
+    pub jev: Jev,
+}
+
+/// A message produced by a turn, after recipient resolution and ack filtering.
+#[derive(Debug, Clone)]
+pub struct Outgoing {
+    pub to: String,
+    pub content: String,
+    pub wake: bool,
+}
+
+/// What a finished turn asks the orchestrator to do.
+#[derive(Debug, Default)]
+pub struct Routed {
+    pub messages: Vec<Outgoing>,
+    pub final_answer: Option<String>,
 }
 
 pub struct NewSession {
@@ -104,7 +124,7 @@ impl Orchestrator {
             let Some(agent) = inner.meta.agents.get_mut(to) else {
                 anyhow::bail!("unknown persona '{to}'");
             };
-            agent.inbox.push(InboxMessage { from: USER.into(), content: content.into() });
+            agent.inbox.push(InboxMessage { from: USER.into(), content: content.into(), wake: true });
             if agent.status != AgentStatus::Running {
                 agent.status = AgentStatus::Queued;
             }
@@ -113,7 +133,13 @@ impl Orchestrator {
             session.emit_locked(
                 &mut inner,
                 None,
-                EventBody::Message { from: USER.into(), to: to.into(), content: content.into(), rejected: false },
+                EventBody::Message {
+                    from: USER.into(),
+                    to: to.into(),
+                    content: content.into(),
+                    rejected: false,
+                    deferred: false,
+                },
             );
             if inner.meta.agents[to].status == AgentStatus::Queued {
                 session.emit_locked(&mut inner, Some(to), EventBody::AgentStatus { status: AgentStatus::Queued });
@@ -124,6 +150,122 @@ impl Orchestrator {
         }
         self.start(session);
         Ok(())
+    }
+
+    /// Picks the persona that should handle a user message (`to: "auto"`); falls back to the entry.
+    pub async fn route_user_message(&self, session: &Arc<Session>, content: &str) -> String {
+        let (team, task, dry_run) = {
+            let inner = session.lock();
+            (inner.meta.team.clone(), inner.meta.task.clone(), inner.meta.dry_run)
+        };
+        let cfg = self.decisions_cfg();
+        if dry_run || !cfg.active() || !cfg.route_user_messages {
+            return team.entry;
+        }
+        let res = self.jev.route_user_message(&cfg, &team, &task, content).await;
+        let chosen = match &res {
+            Ok(v) if v.confidence >= cfg.route_min_confidence && team.persona(&v.value).is_some() => {
+                Some(v.value.clone())
+            }
+            _ => None,
+        };
+        record(session, None, DecisionKind::RouteUser, "user message".into(), &res, chosen.is_some(), |v| v.clone());
+        chosen.unwrap_or(team.entry)
+    }
+
+    fn decisions_cfg(&self) -> DecisionsConfig {
+        self.decisions.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Turns a persona's reply into deliveries, using Jev for quick routing decisions.
+    async fn route_output(
+        &self,
+        session: &Arc<Session>,
+        team: &Team,
+        persona: &Persona,
+        output: &TurnOutput,
+    ) -> Routed {
+        let directives = parse_directives(&output.text);
+        let mut routed = Routed {
+            messages: directives
+                .messages
+                .into_iter()
+                .map(|(to, content)| Outgoing { to, content, wake: true })
+                .collect(),
+            final_answer: directives.final_answer,
+        };
+        let cfg = self.decisions_cfg();
+        if session.lock().meta.dry_run || !cfg.active() || output.error.is_some() {
+            return routed;
+        }
+        let from = persona.id.as_str();
+
+        // 1. Messages addressed to an id that is not on the team: ask which teammate was meant.
+        if cfg.resolve_recipients {
+            let candidates = team.recipients_of(from);
+            for m in routed.messages.iter_mut().filter(|m| m.to != USER && team.persona(&m.to).is_none()) {
+                if candidates.is_empty() {
+                    break;
+                }
+                let res = self.jev.resolve_recipient(&cfg, persona, &m.to, &m.content, &candidates).await;
+                let resolved = match &res {
+                    Ok(v)
+                        if v.value != "none"
+                            && v.confidence >= cfg.resolve_min_confidence
+                            && team.can_send(from, &v.value) =>
+                    {
+                        Some(v.value.clone())
+                    }
+                    _ => None,
+                };
+                let subject = format!("unknown recipient `{}` from {from}", m.to);
+                record(session, Some(from), DecisionKind::ResolveRecipient, subject, &res, resolved.is_some(), |v| {
+                    v.clone()
+                });
+                if let Some(to) = resolved {
+                    m.to = to;
+                }
+            }
+        }
+
+        // 2. Acknowledgements should not start a (potentially expensive) turn of the recipient.
+        if cfg.ack_filter {
+            let cfg = &cfg;
+            let checks = routed.messages.iter().enumerate().filter_map(|(i, m)| {
+                let to = team.persona(&m.to).filter(|_| team.can_send(from, &m.to))?;
+                Some(async move { (i, self.jev.classify_message(cfg, persona, to, &m.content).await) })
+            });
+            for (i, res) in futures::future::join_all(checks).await {
+                let is_ack = matches!(&res, Ok(v) if v.value == "ack" && v.confidence >= cfg.ack_min_confidence);
+                let subject = format!("message {from} → {}", routed.messages[i].to);
+                record(session, Some(from), DecisionKind::AckFilter, subject, &res, is_ack, |v| v.clone());
+                if is_ack {
+                    routed.messages[i].wake = false;
+                }
+            }
+        }
+
+        // 3. The entry persona says it is done but forgot <final>, and nothing else is pending.
+        let quiet = routed.final_answer.is_none()
+            && !routed.messages.iter().any(|m| m.wake)
+            && !output.text.trim().is_empty()
+            && {
+                let inner = session.lock();
+                inner.running.iter().all(|id| id == from)
+                    && inner.meta.agents.iter().all(|(id, a)| id == from || !a.has_work())
+            };
+        if cfg.detect_final && from == team.entry && quiet {
+            let task = session.lock().meta.task.clone();
+            let res = self.jev.task_complete(&cfg, &task, &output.text).await;
+            let done = matches!(&res, Ok(v) if v.value >= cfg.final_threshold);
+            record(session, Some(from), DecisionKind::DetectFinal, format!("reply of {from}"), &res, done, |p| {
+                format!("P(task complete) = {p:.2}")
+            });
+            if done {
+                routed.final_answer = Some(strip_directives(&output.text));
+            }
+        }
+        routed
     }
 
     pub fn cancel(&self, session: &Arc<Session>) {
@@ -184,7 +326,7 @@ impl Orchestrator {
                 break;
             }
             let agent = &inner.meta.agents[&persona.id];
-            if agent.inbox.is_empty() || inner.running.contains(&persona.id) {
+            if !agent.has_work() || inner.running.contains(&persona.id) {
                 continue;
             }
             self.start_turn(session, inner, persona.clone());
@@ -225,6 +367,7 @@ impl Orchestrator {
         let team = inner.meta.team.clone();
         let task = inner.meta.task.clone();
         let session = session.clone();
+        let orch = self.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogLine>();
@@ -260,7 +403,9 @@ impl Orchestrator {
                 }
             };
             let _ = forward.await;
-            complete_turn(&session, &persona, turn, incoming, output, started.elapsed());
+            let elapsed = started.elapsed();
+            let routed = orch.route_output(&session, &team, &persona, &output).await;
+            complete_turn(&session, &persona, turn, incoming, output, routed, elapsed);
         });
     }
 }
@@ -272,6 +417,7 @@ fn complete_turn(
     turn: u32,
     incoming: Vec<InboxMessage>,
     output: TurnOutput,
+    routed: Routed,
     elapsed: Duration,
 ) {
     let mut inner = session.lock();
@@ -289,18 +435,24 @@ fn complete_turn(
         EventBody::TurnEnd { turn, duration_ms: elapsed.as_millis() as u64, error: output.error.clone() },
     );
 
-    let directives = parse_directives(&output.text);
     let mut notes = vec![];
-    let mut deliveries: Vec<(String, String)> = vec![];
-    for (to, content) in directives.messages {
-        let allowed = team.persona(&to).is_some() && team.can_send(from, &to);
+    let mut deliveries: Vec<Outgoing> = vec![];
+    for m in routed.messages {
+        let allowed = team.persona(&m.to).is_some() && team.can_send(from, &m.to);
         session.emit_locked(
             &mut inner,
             None,
-            EventBody::Message { from: from.into(), to: to.clone(), content: content.clone(), rejected: !allowed },
+            EventBody::Message {
+                from: from.into(),
+                to: m.to.clone(),
+                content: m.content.clone(),
+                rejected: !allowed,
+                deferred: allowed && !m.wake,
+            },
         );
+        let to = m.to.clone();
         if allowed {
-            deliveries.push((to, content));
+            deliveries.push(m);
         } else if to == USER {
             notes.push(
                 "Messages to `user` are not delivered. The entry persona reports to the user with <final>.".into(),
@@ -314,20 +466,21 @@ fn complete_turn(
     if failed {
         let err = output.error.clone().unwrap_or_default();
         for m in incoming.iter().filter(|m| m.from != USER) {
-            if team.persona(&m.from).is_some() && !deliveries.iter().any(|(to, _)| to == &m.from) {
-                deliveries.push((
-                    m.from.clone(),
-                    format!(
+            if team.persona(&m.from).is_some() && !deliveries.iter().any(|d| d.to == m.from) {
+                deliveries.push(Outgoing {
+                    to: m.from.clone(),
+                    content: format!(
                         "[chimera] {} ({from}) failed while handling your message: {}",
                         persona.name,
                         truncate(&err, 500)
                     ),
-                ));
+                    wake: true,
+                });
             }
         }
     }
 
-    if let Some(final_answer) = directives.final_answer {
+    if let Some(final_answer) = routed.final_answer {
         if from == team.entry {
             inner.meta.final_answer = Some(final_answer.clone());
             session.emit_locked(&mut inner, Some(from), EventBody::Final { content: final_answer });
@@ -349,10 +502,10 @@ fn complete_turn(
         }
     }
 
-    for (to, content) in deliveries {
+    for Outgoing { to, content, wake } in deliveries {
         let target = inner.meta.agents.get_mut(&to).expect("validated recipient");
-        target.inbox.push(InboxMessage { from: from.into(), content });
-        if target.status != AgentStatus::Running && target.status != AgentStatus::Queued {
+        target.inbox.push(InboxMessage { from: from.into(), content, wake });
+        if wake && target.status != AgentStatus::Running && target.status != AgentStatus::Queued {
             target.status = AgentStatus::Queued;
             session.emit_locked(&mut inner, Some(&to), EventBody::AgentStatus { status: AgentStatus::Queued });
         }
@@ -361,7 +514,7 @@ fn complete_turn(
     let agent = inner.meta.agents.get_mut(from).expect("agent exists");
     agent.status = if failed {
         AgentStatus::Error
-    } else if agent.inbox.is_empty() {
+    } else if !agent.has_work() {
         AgentStatus::Waiting
     } else {
         AgentStatus::Queued
@@ -378,7 +531,7 @@ fn complete_turn(
 fn finalize(session: &Arc<Session>, inner: &mut Inner) {
     let (status, detail) = match inner.stopping.take() {
         Some(s) => s,
-        None if inner.meta.agents.values().any(|a| !a.inbox.is_empty()) => (
+        None if inner.meta.agents.values().any(|a| a.has_work()) => (
             SessionStatus::Idle,
             Some(format!("turn limit reached ({} turns); send a message to continue", inner.meta.team.max_turns)),
         ),
@@ -399,7 +552,7 @@ fn finalize(session: &Arc<Session>, inner: &mut Inner) {
             (SessionStatus::Completed, AgentStatus::Idle) => AgentStatus::Idle,
             (SessionStatus::Completed, _) => AgentStatus::Done,
             (_, AgentStatus::Running) => AgentStatus::Waiting,
-            (_, s) if !agent.inbox.is_empty() => s,
+            (_, s) if agent.has_work() => s,
             (_, AgentStatus::Queued) => AgentStatus::Waiting,
             (_, s) => s,
         };
@@ -449,6 +602,60 @@ pub fn parse_directives(text: &str) -> Directives {
         }
     }
     d
+}
+
+/// The reply without `<message>` blocks, used as the final answer when `<final>` was missing.
+fn strip_directives(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<message") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</message>") {
+            Some(end) => rest = &rest[start + end + "</message>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Emits a `Decision` event for a Jev call.
+fn record<T>(
+    session: &Session,
+    agent: Option<&str>,
+    kind: DecisionKind,
+    subject: String,
+    res: &anyhow::Result<Verdict<T>>,
+    applied: bool,
+    outcome: impl Fn(&T) -> String,
+) {
+    let body = match res {
+        Ok(v) => EventBody::Decision {
+            kind,
+            subject,
+            outcome: outcome(&v.value),
+            confidence: Some(v.confidence),
+            applied,
+            latency_ms: v.latency_ms,
+            error: None,
+        },
+        Err(e) => {
+            tracing::warn!("jev decision {kind:?} failed: {e:#}");
+            EventBody::Decision {
+                kind,
+                subject,
+                outcome: "skipped".into(),
+                confidence: None,
+                applied: false,
+                latency_ms: 0,
+                error: Some(format!("{e:#}")),
+            }
+        }
+    };
+    session.emit(agent, body);
 }
 
 fn attr(attrs: &str, name: &str) -> Option<String> {
@@ -730,8 +937,18 @@ mod e2e_tests {
     }
 
     fn orchestrator(runtimes: BTreeMap<String, RuntimeSpec>) -> Arc<Orchestrator> {
+        orchestrator_with(runtimes, DecisionsConfig { enabled: false, ..Default::default() })
+    }
+
+    fn orchestrator_with(runtimes: BTreeMap<String, RuntimeSpec>, decisions: DecisionsConfig) -> Arc<Orchestrator> {
         let d = temp_dir();
-        Arc::new(Orchestrator { runtimes, sessions_dir: d.join("sessions"), workspaces_dir: d.join("ws") })
+        Arc::new(Orchestrator {
+            runtimes,
+            sessions_dir: d.join("sessions"),
+            workspaces_dir: d.join("ws"),
+            decisions: RwLock::new(decisions),
+            jev: Jev::new(),
+        })
     }
 
     async fn wait_until_settled(session: &Arc<Session>) -> SessionStatus {
@@ -851,5 +1068,127 @@ mod e2e_tests {
         assert!(session.lock().scheduler_active);
         orch.cancel(&session);
         assert_eq!(wait_until_settled(&session).await, SessionStatus::Cancelled);
+    }
+
+    /// A stand-in for the Jev API that answers like the documented examples.
+    async fn fake_jev() -> String {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use serde_json::{Value, json};
+        async fn systemone(headers: HeaderMap, Json(req): Json<Value>) -> Json<Value> {
+            assert_eq!(headers["authorization"], "Bearer test-jev-key");
+            assert_eq!(req["model"], "jev-latest");
+            let q = &req["questions"]["q"];
+            let answer = match q["type"].as_str().unwrap() {
+                "noul" => json!({"type": "noul", "noul": 0.97}),
+                _ if q["criteria"].get("none").is_some() => {
+                    json!({"type": "choice", "choice": "worker", "probabilities": {}, "confidence": 0.9})
+                }
+                _ if q["criteria"].get("ack").is_some() => {
+                    let msg = req["state"]["message"].as_str().unwrap().to_lowercase();
+                    let kind = if msg.contains("thanks") { "ack" } else { "report" };
+                    json!({"type": "choice", "choice": kind, "probabilities": {}, "confidence": 0.85})
+                }
+                _ => json!({"type": "choice", "choice": "worker", "probabilities": {}, "confidence": 0.8}),
+            };
+            Json(
+                json!({"model": "jev-1.13.0", "answers": {"q": answer}, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/systemone", post(systemone))).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn jev_resolves_recipients_filters_acks_and_detects_final() {
+        // Lead misaddresses the worker; the worker reports to the lead and thanks the helper;
+        // the lead then says it is done without <final>.
+        let script = r#"
+            prompt=$(cat)
+            case "$prompt" in
+              *"id \`lead\`"*"From the user"*) printf '<message to="the_worker">compute it</message>\n' ;;
+              *"id \`worker\`"*) printf '<message to="lead">result: 42</message>\n<message to="helper">thanks for the help</message>\n' ;;
+              *"id \`lead\`"*) printf 'All done. The answer is 42.\n' ;;
+              *) printf 'helper should never run\n' ;;
+            esac
+        "#;
+        let mut rts = builtin_runtimes();
+        rts.insert(
+            "sh".into(),
+            RuntimeSpec {
+                label: "sh".into(),
+                command: "sh".into(),
+                args: vec![ArgItem::One("-c".into()), ArgItem::One(script.into())],
+                output: OutputFormat::Text,
+                ..rts["hermes"].clone()
+            },
+        );
+        let team: Team = serde_yaml::from_str(
+            "id: t\nname: T\nentry: lead\npersonas:\n  - {id: lead, name: Lead, runtime: sh}\n  - {id: worker, name: Worker, runtime: sh}\n  - {id: helper, name: Helper, runtime: sh}\nedges:\n  - {from: lead, to: worker, bidirectional: true}\n  - {from: worker, to: helper, bidirectional: true}\n",
+        )
+        .unwrap();
+        // SAFETY: test-only variable with a unique name, not read by other tests.
+        unsafe { std::env::set_var("CHIMERA_TEST_JEV_KEY", "test-jev-key") };
+        let cfg = DecisionsConfig {
+            base_url: fake_jev().await,
+            api_key_env: "CHIMERA_TEST_JEV_KEY".into(),
+            ..Default::default()
+        };
+        let orch = orchestrator_with(rts, cfg);
+        let session = orch
+            .create_session(NewSession { team, task: "compute".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+
+        {
+            let inner = session.lock();
+            assert_eq!(inner.meta.final_answer.as_deref(), Some("All done. The answer is 42."));
+            assert_eq!(inner.meta.agents["worker"].turns, 1, "misaddressed message was resolved");
+            assert_eq!(inner.meta.agents["lead"].turns, 2);
+            assert_eq!(inner.meta.agents["helper"].turns, 0, "acknowledgement did not wake the helper");
+            let deferred = inner
+                .events
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::Message { to, deferred: true, .. } if to == "helper"));
+            assert!(deferred);
+            let kinds: Vec<DecisionKind> = inner
+                .events
+                .iter()
+                .filter_map(|e| match &e.body {
+                    EventBody::Decision { kind, applied: true, .. } => Some(*kind),
+                    _ => None,
+                })
+                .collect();
+            assert!(kinds.contains(&DecisionKind::ResolveRecipient));
+            assert!(kinds.contains(&DecisionKind::AckFilter));
+            assert!(kinds.contains(&DecisionKind::DetectFinal));
+        }
+
+        // "auto" routing of a follow-up picks the persona Jev chose.
+        assert_eq!(orch.route_user_message(&session, "one more thing").await, "worker");
+    }
+
+    #[tokio::test]
+    async fn jev_failures_fall_back_to_default_behaviour() {
+        unsafe { std::env::set_var("CHIMERA_TEST_JEV_KEY2", "k") };
+        let cfg = DecisionsConfig {
+            base_url: "http://127.0.0.1:9".into(), // nothing listens here
+            api_key_env: "CHIMERA_TEST_JEV_KEY2".into(),
+            timeout_ms: 500,
+            ..Default::default()
+        };
+        let orch = orchestrator_with(builtin_runtimes(), cfg);
+        let mut team = sample_team();
+        team.personas.iter_mut().for_each(|p| p.runtime = "mock".into());
+        let session = orch
+            .create_session(NewSession { team, task: "x".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        assert_eq!(orch.route_user_message(&session, "hi").await, "dev_lead");
+        let inner = session.lock();
+        assert!(inner.events.iter().any(|e| matches!(&e.body, EventBody::Decision { error: Some(_), .. })));
     }
 }

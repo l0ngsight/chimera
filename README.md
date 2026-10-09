@@ -13,6 +13,9 @@ you define in the web UI.
   messages.
 - **Parallel sessions**: run as many sessions as you like at once, with the same team or different ones. Each
   session gets its own shared workspace directory, and agents within a session also run in parallel.
+- **Quick decisions with Jev**: TypeSafe's decision model handles cheap routing calls between turns (about 100ms
+  each) instead of running another agent turn: it skips turns for acknowledgements, fixes misaddressed messages,
+  notices a missing `<final>`, and auto-routes your follow-ups.
 - **Dry runs**: a built-in mock runtime simulates the whole team without calling any LLM, which is handy for
   checking a new graph.
 
@@ -75,6 +78,27 @@ within a size budget. Codex can be switched to native resume as well (see `chime
 
 **Workspace.** By default each session gets `data/workspaces/<session-id>`. You can also point a session at an
 existing repository. All personas of a session share this directory.
+
+## Quick decisions with Jev
+
+Some orchestration steps need a judgement call, not an agent turn. Chimera hands these to
+[Jev](https://docs.typesafe.ai), TypeSafe's "System One" model. Jev answers typed questions (choice or yes/no)
+in about 100ms, at a small fraction of an LLM call's cost. Each decision appears in the session timeline with
+its outcome, confidence and latency.
+
+| Decision | When | Effect |
+|---|---|---|
+| **Ack filter** | every teammate message | If Jev judges a message to be only an acknowledgement ("thanks", "sounds good"), it is delivered without starting a turn. The recipient reads it on its next turn. This stops thank-you ping-pong from spending Opus turns. |
+| **Recipient repair** | `<message to="…">` names an id that is not on the team | Jev picks which allowed teammate was meant (or none). The message is re-addressed, but only along existing edges. |
+| **Missed `<final>`** | the entry persona replies without `<final>` and nothing else is pending | If Jev is confident the reply hands the finished result to the user, the session completes with it. Otherwise it goes idle as before. |
+| **Auto-routing** | you send a follow-up with recipient **⚡ Auto** | Jev picks the persona best suited to handle it, falling back to the entry persona. |
+
+Setup: export `TYPESAFE_API_KEY` (`JEV_API_KEY` is also accepted) for the server, then check
+**Settings → Quick decisions → Test connection**. Each decision has its own switch and confidence threshold.
+Decisions only adjust routing: if Jev is disabled, unreachable or unsure, Chimera behaves exactly as it would
+without it. Dry runs never call Jev.
+
+![Jev decisions in the session timeline](docs/screenshots/jev-decisions.png)
 
 ## Configuration
 
@@ -140,12 +164,13 @@ be resumed by sending it a message.
 | `GET /api/runtimes` | runtimes, availability, model suggestions |
 | `GET/POST /api/teams`, `GET/PUT/DELETE /api/teams/{id}` | team CRUD |
 | `POST /api/personas/generate` | generate a persona prompt with the configured LLM |
-| `GET/PUT /api/settings` | prompt-LLM settings |
+| `GET/PUT /api/settings` | prompt-LLM and Jev settings (`{prompt_llm?, decisions?}`) |
+| `POST /api/decisions/test` | send a minimal request to Jev |
 | `GET/POST /api/sessions` | list / start sessions (`{team_id, task, title?, workdir?, dry_run?}`) |
 | `GET/DELETE /api/sessions/{id}` | session summary and team snapshot / delete |
 | `GET /api/sessions/{id}/stream` | server-sent events: full history, then live events |
 | `GET /api/sessions/{id}/events?agent=ID` | event log, optionally for one persona |
-| `POST /api/sessions/{id}/messages` | send `{to?, content}` (defaults to the entry persona) |
+| `POST /api/sessions/{id}/messages` | send `{to?, content}` (defaults to the entry persona; `"auto"` lets Jev route) |
 | `POST /api/sessions/{id}/cancel` | stop running agents |
 
 ## Development
@@ -157,5 +182,5 @@ cargo clippy --all-targets
 
 Source map: `model.rs` (teams/graph), `config.rs` (runtimes and LLM settings), `runtime.rs` (process
 launching and output parsers), `orchestrator.rs` (scheduler, prompt building, message protocol, mock runtime),
-`session.rs` (state, events, persistence), `promptgen.rs` (persona prompt generation), `web.rs` (API and SSE),
+`session.rs` (state, events, persistence), `decisions.rs` (Jev client and decision questions), `promptgen.rs` (persona prompt generation), `web.rs` (API and SSE),
 `web/` (UI, embedded into the binary).

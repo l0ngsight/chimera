@@ -1,4 +1,5 @@
 mod config;
+mod decisions;
 mod model;
 mod orchestrator;
 mod promptgen;
@@ -61,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = cfg.data_dir.canonicalize()?;
     let teams = TeamStore::open(data_dir.join("teams"))?;
     let settings = SettingsStore::new(data_dir.join("settings.yaml"));
-    let prompt_llm = settings.load().unwrap_or_else(|| cfg.prompt_llm.clone());
+    let saved = settings.load();
+    let prompt_llm = saved.as_ref().map(|s| s.prompt_llm.clone()).unwrap_or_else(|| cfg.prompt_llm.clone());
+    let decisions_cfg = saved.and_then(|s| s.decisions).unwrap_or_else(|| cfg.decisions.clone());
 
     let sessions_dir = data_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
@@ -80,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
         runtimes: cfg.runtimes.clone(),
         sessions_dir,
         workspaces_dir: data_dir.join("workspaces"),
+        decisions: RwLock::new(decisions_cfg),
+        jev: decisions::Jev::new(),
     });
     let state = Arc::new(AppState {
         teams,

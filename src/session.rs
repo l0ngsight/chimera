@@ -83,6 +83,23 @@ pub enum EventBody {
         content: String,
         #[serde(default)]
         rejected: bool,
+        /// Delivered without starting a turn (e.g. an acknowledgement); read on the next turn.
+        #[serde(default, skip_serializing_if = "is_false")]
+        deferred: bool,
+    },
+    /// A quick orchestration decision made with Jev.
+    Decision {
+        kind: DecisionKind,
+        /// What was decided about, e.g. "message dev_lead → qa".
+        subject: String,
+        outcome: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+        /// Whether chimera acted on the outcome.
+        applied: bool,
+        latency_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     TurnStart {
         turn: u32,
@@ -98,11 +115,35 @@ pub enum EventBody {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    /// Is a teammate message only an acknowledgement?
+    AckFilter,
+    /// Which teammate did an unknown recipient id mean?
+    ResolveRecipient,
+    /// Did the entry persona finish without emitting `<final>`?
+    DetectFinal,
+    /// Which persona should handle a user message?
+    RouteUser,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn yes() -> bool {
+    true
+}
+
 /// A message waiting in a persona's inbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {
     pub from: String,
     pub content: String,
+    /// Whether this message should start a turn. Non-waking messages are read on the next turn.
+    #[serde(default = "yes")]
+    pub wake: bool,
 }
 
 /// One completed turn, kept to rebuild context for stateless runtimes.
@@ -125,6 +166,13 @@ pub struct AgentState {
     pub notes: Vec<String>,
     #[serde(default)]
     pub inbox: Vec<InboxMessage>,
+}
+
+impl AgentState {
+    /// Has messages that should start a turn.
+    pub fn has_work(&self) -> bool {
+        self.inbox.iter().any(|m| m.wake)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,7 +412,16 @@ impl Inner {
             agents: m
                 .agents
                 .iter()
-                .map(|(k, a)| (k.clone(), AgentSummary { status: a.status, turns: a.turns, queued: a.inbox.len() }))
+                .map(|(k, a)| {
+                    (
+                        k.clone(),
+                        AgentSummary {
+                            status: a.status,
+                            turns: a.turns,
+                            queued: a.inbox.iter().filter(|m| m.wake).count(),
+                        },
+                    )
+                })
                 .collect(),
         }
     }

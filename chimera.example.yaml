@@ -13,6 +13,23 @@ prompt_llm:
   api_key_env: DEEPSEEK_API_KEY   # name of the env var; the key is never written to disk
   temperature: 0.7
 
+# Quick orchestration decisions with Jev (TypeSafe's decision model), also editable under Settings.
+# Every decision is optional: if Jev is disabled, has no key, or fails, chimera behaves as without it.
+decisions:
+  enabled: true
+  base_url: https://api.typesafe.ai/v1   # requests go to {base_url}/systemone
+  model: jev-latest                      # pin e.g. jev-1.13.0 for reproducible behaviour
+  api_key_env: TYPESAFE_API_KEY          # falls back to TYPESAFE_API_KEY, then JEV_API_KEY
+  timeout_ms: 5000
+  ack_filter: true             # don't wake a persona for "thanks / sounds good" messages
+  ack_min_confidence: 0.6
+  resolve_recipients: true     # re-address <message to="backend_engineer"> to the intended teammate
+  resolve_min_confidence: 0.5
+  detect_final: true           # complete when the entry persona is done but forgot <final>
+  final_threshold: 0.9
+  route_user_messages: true    # "Auto" recipient for user follow-ups
+  route_min_confidence: 0.4
+
 # Runtime definitions. Argument templates support {model} {effort} {prompt} {workdir} {native_session}.
 # A nested list is a group that is dropped when any placeholder in it is empty.
 # Without {prompt} in the args, the prompt is written to stdin.

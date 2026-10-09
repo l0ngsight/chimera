@@ -15,6 +15,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub prompt_llm: PromptLlmConfig,
+    /// Quick orchestration decisions with Jev.
+    #[serde(default)]
+    pub decisions: crate::decisions::DecisionsConfig,
     /// Runtime definitions keyed by name. Merged over the built-in defaults.
     #[serde(default)]
     pub runtimes: BTreeMap<String, RuntimeSpec>,
@@ -292,6 +295,7 @@ impl Default for Config {
             bind: default_bind(),
             data_dir: default_data_dir(),
             prompt_llm: PromptLlmConfig::default(),
+            decisions: Default::default(),
             runtimes: builtin_runtimes(),
         }
     }
@@ -323,6 +327,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn example_config_parses() {
+        let cfg: Config = serde_yaml::from_str(include_str!("../chimera.example.yaml")).unwrap();
+        assert_eq!(cfg.decisions.model, "jev-latest");
+        assert!(cfg.runtimes.contains_key("hermes"));
+    }
 
     #[test]
     fn user_runtimes_override_builtins() {

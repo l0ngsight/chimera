@@ -395,8 +395,9 @@ async function sessionsPage() {
 // ---------------------------------------------------------------- session view
 
 async function sessionPage(id) {
-  const data = await api('GET', '/api/sessions/' + id);
+  const [data, settings] = await Promise.all([api('GET', '/api/sessions/' + id), api('GET', '/api/settings').catch(() => ({}))]);
   const team = data.team;
+  const jevRouting = settings.decisions_active && settings.decisions.route_user_messages && !data.summary.dry_run;
   let summary = data.summary;
   const events = [];
   let lastSeq = 0;
@@ -441,8 +442,10 @@ async function sessionPage(id) {
   const panelSub = h('span', { class: 'muted small' });
   const tabs = h('div', { class: 'tabs' });
   const body = h('div', { class: 'panel-body' });
-  const toSel = h('select', { style: 'width:auto' }, team.personas.map(p => h('option', { value: p.id }, p.name + (p.id === team.entry ? ' (entry)' : ''))));
-  toSel.value = team.entry;
+  const toSel = h('select', { style: 'width:auto' },
+    jevRouting ? h('option', { value: 'auto', title: 'Jev picks the persona best suited to answer' }, '⚡ Auto (Jev routes)') : null,
+    team.personas.map(p => h('option', { value: p.id }, p.name + (p.id === team.entry ? ' (entry)' : ''))));
+  toSel.value = jevRouting ? 'auto' : team.entry;
   const msgInput = h('textarea', { placeholder: 'Send a message or follow-up instruction…' });
   const sendBtn = h('button', { class: 'primary', onclick: send }, 'Send');
   msgInput.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send(); });
@@ -487,7 +490,7 @@ async function sessionPage(id) {
   }
 
   function matches(e) {
-    if (!selected) return e.type === 'message' || e.type === 'final' || e.type === 'session_status';
+    if (!selected) return ['message', 'final', 'session_status', 'decision'].includes(e.type);
     if (e.type === 'message') return e.from === selected || e.to === selected;
     return e.agent === selected && e.type !== 'agent_status';
   }
@@ -501,6 +504,7 @@ async function sessionPage(id) {
             selected ? (toMe ? '← from ' : '→ to ') : null,
             selected ? h('b', {}, personaName(toMe ? e.from : e.to)) : [h('b', {}, personaName(e.from)), ' → ', h('b', {}, personaName(e.to))],
             e.rejected ? h('span', { style: 'color:var(--error)' }, '(not delivered: no channel)') : null,
+            e.deferred ? h('span', { class: 'jev', title: 'Jev judged this an acknowledgement: delivered without starting a turn; read on the next one' }, '⚡ deferred') : null,
             h('span', { class: 'spacer' }), fmtTime(e.ts)),
           h('div', { class: 'msg-body' }, e.content));
       }
@@ -512,9 +516,28 @@ async function sessionPage(id) {
         return h('div', { class: 'turn-sep' }, `turn #${e.turn} · ${fmtTime(e.ts)}`);
       case 'turn_end':
         return h('div', { class: 'status-line' }, `turn #${e.turn} finished in ${(e.duration_ms / 1000).toFixed(1)}s` + (e.error ? ` with error` : ''));
+      case 'decision': return renderDecision(e);
       case 'log': return renderLog(e);
       default: return null;
     }
+  }
+
+  function renderDecision(e) {
+    const label = { ack_filter: 'ack filter', resolve_recipient: 'recipient', detect_final: 'completion', route_user: 'routing' }[e.kind] || e.kind;
+    const outcome = e.kind === 'route_user' || e.kind === 'resolve_recipient' ? personaName(e.outcome) : e.outcome;
+    const effect = !e.applied ? '' : {
+      ack_filter: ' → delivered without waking',
+      resolve_recipient: ' → message re-addressed',
+      detect_final: ' → session completed',
+      route_user: ' → message sent there',
+    }[e.kind] || '';
+    return h('div', { class: 'decision' + (e.error ? ' failed' : e.applied ? ' applied' : '') },
+      h('span', { class: 'jev' }, '⚡ Jev'), ' ', h('b', {}, label), ' · ', e.subject, ': ',
+      e.error ? h('span', { title: e.error }, 'skipped (' + e.error.slice(0, 120) + ')') : [
+        h('b', {}, outcome),
+        e.confidence != null ? h('span', { class: 'muted' }, ` (${Math.round(e.confidence * 100)}% conf, ${e.latency_ms}ms)`) : null,
+        effect,
+      ]);
   }
 
   function renderLog(e) {
@@ -883,6 +906,73 @@ const PRESETS = {
   'Ollama (local)': { api: 'openai', base_url: 'http://localhost:11434/v1', model: 'llama3.3', api_key_env: 'OLLAMA_API_KEY' },
 };
 
+/** Settings for quick orchestration decisions with Jev. */
+function jevCard(settings) {
+  const d = settings.decisions;
+  const num = (v, step = '0.05') => h('input', { type: 'number', step, min: 0, max: 1, value: v, style: 'width:90px' });
+  const f = {
+    enabled: h('input', { type: 'checkbox', checked: d.enabled }),
+    base_url: h('input', { value: d.base_url }),
+    model: h('input', { value: d.model }),
+    api_key_env: h('input', { value: d.api_key_env, class: 'mono' }),
+    timeout_ms: h('input', { type: 'number', min: 100, step: 100, value: d.timeout_ms, style: 'width:110px' }),
+    ack_filter: h('input', { type: 'checkbox', checked: d.ack_filter }),
+    ack_min_confidence: num(d.ack_min_confidence),
+    resolve_recipients: h('input', { type: 'checkbox', checked: d.resolve_recipients }),
+    resolve_min_confidence: num(d.resolve_min_confidence),
+    detect_final: h('input', { type: 'checkbox', checked: d.detect_final }),
+    final_threshold: num(d.final_threshold),
+    route_user_messages: h('input', { type: 'checkbox', checked: d.route_user_messages }),
+    route_min_confidence: num(d.route_min_confidence),
+  };
+  const status = h('div', { class: 'small' });
+  const showStatus = s => {
+    status.className = 'small ' + (s.decisions_active ? 'muted' : 'avail no');
+    status.textContent = s.decisions_active
+      ? `✔ active, key read from $${s.decisions_key_env}`
+      : !s.decisions.enabled ? '✖ disabled' : `✖ no API key: set $${s.decisions.api_key_env} (or TYPESAFE_API_KEY / JEV_API_KEY) for the server`;
+  };
+  showStatus(settings);
+  const testOut = h('span', { class: 'muted small' });
+  const values = () => {
+    const out = {};
+    for (const [k, el] of Object.entries(f)) out[k] = el.type === 'checkbox' ? el.checked : el.type === 'number' ? +el.value : el.value;
+    return out;
+  };
+  async function save() {
+    try { showStatus(await api('PUT', '/api/settings', { decisions: values() })); toast('Jev settings saved'); }
+    catch (e) { toast(e.message, true); }
+  }
+  async function test() {
+    testOut.replaceChildren(h('span', { class: 'spinner' }));
+    try {
+      await save();
+      const r = await api('POST', '/api/decisions/test');
+      testOut.textContent = `✔ ${r.model} answered in ${r.latency_ms}ms`;
+    } catch (e) { testOut.textContent = ''; toast(e.message, true); }
+  }
+  const toggle = (box, text, thr, thrLabel) => h('div', { class: 'row', style: 'margin:8px 0' },
+    h('label', { class: 'inline', style: 'flex:1' }, box, text),
+    thr ? h('span', { class: 'muted small' }, thrLabel) : null, thr);
+  return h('div', { class: 'card', style: 'grid-column: 1 / -1' },
+    h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, '⚡ Quick decisions (Jev)'), h('label', { class: 'inline' }, f.enabled, 'Enabled')),
+    h('p', { class: 'muted small' },
+      'Jev (TypeSafe’s decision model) makes cheap ~100ms calls between agent turns. Each one only adjusts routing; if Jev is off or fails, Chimera behaves as without it. Decisions appear in the session timeline. Dry runs never call Jev.'),
+    status,
+    h('div', { class: 'grid', style: 'grid-template-columns: 2fr 1fr 1fr 120px; gap: 0 10px' },
+      h('div', {}, h('label', {}, 'Base URL'), f.base_url),
+      h('div', {}, h('label', {}, 'Model'), f.model),
+      h('div', {}, h('label', {}, 'API key environment variable'), f.api_key_env),
+      h('div', {}, h('label', {}, 'Timeout (ms)'), f.timeout_ms)),
+    h('div', { style: 'margin-top:12px' },
+      toggle(f.ack_filter, 'Don’t wake a persona for pure acknowledgements (“thanks”, “sounds good”); they are read on its next turn', f.ack_min_confidence, 'min confidence'),
+      toggle(f.resolve_recipients, 'Re-address messages sent to an unknown teammate id (e.g. “backend_engineer” → backend)', f.resolve_min_confidence, 'min confidence'),
+      toggle(f.detect_final, 'Complete the session when the entry persona reports the task done but forgets <final>', f.final_threshold, 'min probability'),
+      toggle(f.route_user_messages, 'Offer “Auto” as recipient of your follow-up messages', f.route_min_confidence, 'min confidence')),
+    h('div', { class: 'row', style: 'margin-top:14px' }, testOut, h('span', { class: 'spacer' }),
+      h('button', { onclick: test }, 'Test connection'), h('button', { class: 'primary', onclick: save }, 'Save')));
+}
+
 async function settingsPage() {
   const [settings, rts] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/runtimes')]);
   const cfg = settings.prompt_llm;
@@ -898,7 +988,7 @@ async function settingsPage() {
   async function save() {
     try {
       const res = await api('PUT', '/api/settings', {
-        api: f.api.value, base_url: f.base_url.value, model: f.model.value, api_key_env: f.api_key_env.value, temperature: +f.temperature.value,
+        prompt_llm: { api: f.api.value, base_url: f.base_url.value, model: f.model.value, api_key_env: f.api_key_env.value, temperature: +f.temperature.value },
       });
       keyStatus.textContent = res.api_key_present ? '✔ key found in the server environment' : '✖ variable not set in the server environment';
       keyStatus.className = 'small ' + (res.api_key_present ? 'muted' : 'avail no');
@@ -919,7 +1009,8 @@ async function settingsPage() {
         h('label', {}, 'API key environment variable'), f.api_key_env, keyStatus,
         h('label', {}, 'Temperature'), f.temperature,
         h('div', { class: 'row', style: 'margin-top:14px' }, h('span', { class: 'spacer' }), h('button', { class: 'primary', onclick: save }, 'Save'))),
-      h('div', { class: 'card' },
+      jevCard(settings),
+      h('div', { class: 'card', style: 'grid-column: 1 / -1' },
         h('h2', {}, 'Agent runtimes'),
         h('p', { class: 'muted small' }, 'Configured in chimera.yaml (command templates, output parsers, model suggestions).'),
         h('table', {},
