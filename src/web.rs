@@ -229,7 +229,7 @@ async fn put_settings(
 async fn test_decisions(State(st): State<Arc<AppState>>) -> AppResult<Json<serde_json::Value>> {
     let cfg = st.orchestrator.decisions.read().unwrap().clone();
     let v = st.orchestrator.jev.ping(&cfg).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    Ok(Json(json!({ "model": v.model, "latency_ms": v.latency_ms, "answer": v.value })))
+    Ok(Json(json!({ "model": v.model, "latency_ms": v.latency_ms, "cost": v.cost, "answer": v.value })))
 }
 
 async fn list_sessions(State(st): State<Arc<AppState>>) -> Json<Vec<crate::session::SessionSummary>> {

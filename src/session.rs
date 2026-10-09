@@ -98,6 +98,9 @@ pub enum EventBody {
         /// Whether chimera acted on the outcome.
         applied: bool,
         latency_ms: u64,
+        /// USD, when the provider reports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

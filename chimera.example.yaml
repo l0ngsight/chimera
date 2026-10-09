@@ -17,9 +17,10 @@ prompt_llm:
 # Every decision is optional: if Jev is disabled, has no key, or fails, chimera behaves as without it.
 decisions:
   enabled: true
-  base_url: https://api.typesafe.ai/v1   # requests go to {base_url}/systemone
-  model: jev-latest                      # pin e.g. jev-1.13.0 for reproducible behaviour
-  api_key_env: TYPESAFE_API_KEY          # falls back to TYPESAFE_API_KEY, then JEV_API_KEY
+  # OpenRouter's System One API (default). For TypeSafe directly use https://api.typesafe.ai/v1.
+  base_url: https://openrouter.ai/api/v1 # requests go to {base_url}/systemone
+  model: jev-latest                      # OpenRouter maps it to ~typesafe/jev-latest; pin e.g. jev-1.13
+  api_key_env: JEV_API_KEY               # your OpenRouter key; falls back to OPENROUTER_API_KEY, TYPESAFE_API_KEY
   timeout_ms: 5000
   ack_filter: true             # don't wake a persona for "thanks / sounds good" messages
   ack_min_confidence: 0.6

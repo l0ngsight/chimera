@@ -23,10 +23,11 @@ use crate::model::{Persona, Team};
 #[serde(default)]
 pub struct DecisionsConfig {
     pub enabled: bool,
-    /// Base URL of the TypeSafe API; requests go to `{base_url}/systemone`.
+    /// Base URL of a System One API; requests go to `{base_url}/systemone`.
+    /// OpenRouter: `https://openrouter.ai/api/v1`; TypeSafe direct: `https://api.typesafe.ai/v1`.
     pub base_url: String,
     pub model: String,
-    /// Environment variable with the API key (falls back to `TYPESAFE_API_KEY`, then `JEV_API_KEY`).
+    /// Environment variable with the API key (falls back to the variables in `FALLBACK_KEY_ENVS`).
     pub api_key_env: String,
     pub timeout_ms: u64,
     /// Do not start a turn for messages that are only acknowledgements.
@@ -48,9 +49,9 @@ impl Default for DecisionsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            base_url: "https://api.typesafe.ai/v1".into(),
+            base_url: OPENROUTER_BASE_URL.into(),
             model: "jev-latest".into(),
-            api_key_env: "TYPESAFE_API_KEY".into(),
+            api_key_env: "JEV_API_KEY".into(),
             timeout_ms: 5000,
             ack_filter: true,
             ack_min_confidence: 0.6,
@@ -64,7 +65,10 @@ impl Default for DecisionsConfig {
     }
 }
 
-const FALLBACK_KEY_ENVS: &[&str] = &["TYPESAFE_API_KEY", "JEV_API_KEY"];
+/// OpenRouter's System One API, which implements TypeSafe's request and response format.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+const FALLBACK_KEY_ENVS: &[&str] = &["JEV_API_KEY", "OPENROUTER_API_KEY", "TYPESAFE_API_KEY"];
 
 impl DecisionsConfig {
     /// The API key and the variable it came from.
@@ -113,6 +117,23 @@ struct SystemOneResponse {
     #[serde(default)]
     model: String,
     answers: BTreeMap<String, Answer>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Usage {
+    /// Reported by OpenRouter (USD).
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+/// Facts about one Jev call.
+#[derive(Debug, Clone)]
+struct CallInfo {
+    model: String,
+    latency_ms: u64,
+    cost: Option<f64>,
 }
 
 /// The outcome of one decision, for the event log.
@@ -122,6 +143,14 @@ pub struct Verdict<T> {
     pub confidence: f64,
     pub latency_ms: u64,
     pub model: String,
+    /// Cost in USD when the provider reports it (OpenRouter does).
+    pub cost: Option<f64>,
+}
+
+impl<T> Verdict<T> {
+    fn new(value: T, confidence: f64, info: CallInfo) -> Self {
+        Self { value, confidence, latency_ms: info.latency_ms, model: info.model, cost: info.cost }
+    }
 }
 
 pub struct Jev {
@@ -140,12 +169,7 @@ impl Jev {
     }
 
     /// Sends one request with a single question and returns its answer.
-    async fn ask(
-        &self,
-        cfg: &DecisionsConfig,
-        state: Value,
-        question: Question,
-    ) -> anyhow::Result<(Answer, String, u64)> {
+    async fn ask(&self, cfg: &DecisionsConfig, state: Value, question: Question) -> anyhow::Result<(Answer, CallInfo)> {
         let (key, _) = cfg.api_key().context("no Jev API key configured")?;
         let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
         let started = Instant::now();
@@ -167,7 +191,9 @@ impl Jev {
         }
         let mut parsed: SystemOneResponse = serde_json::from_value(body).context("unexpected Jev response shape")?;
         let answer = parsed.answers.remove("q").context("Jev response has no answer")?;
-        Ok((answer, parsed.model, started.elapsed().as_millis() as u64))
+        let info =
+            CallInfo { model: parsed.model, latency_ms: started.elapsed().as_millis() as u64, cost: parsed.usage.cost };
+        Ok((answer, info))
     }
 
     async fn noul(
@@ -178,9 +204,7 @@ impl Jev {
         criteria: Option<Value>,
     ) -> anyhow::Result<Verdict<f64>> {
         match self.ask(cfg, state, Question::Noul { instructions, criteria }).await? {
-            (Answer::Noul { noul }, model, latency_ms) => {
-                Ok(Verdict { value: noul, confidence: (noul - 0.5).abs() * 2.0, latency_ms, model })
-            }
+            (Answer::Noul { noul }, info) => Ok(Verdict::new(noul, (noul - 0.5).abs() * 2.0, info)),
             (other, ..) => bail!("expected a noul answer, got {other:?}"),
         }
     }
@@ -193,9 +217,7 @@ impl Jev {
         criteria: BTreeMap<String, Value>,
     ) -> anyhow::Result<Verdict<String>> {
         match self.ask(cfg, state, Question::Choice { instructions, criteria }).await? {
-            (Answer::Choice { choice, confidence }, model, latency_ms) => {
-                Ok(Verdict { value: choice, confidence, latency_ms, model })
-            }
+            (Answer::Choice { choice, confidence }, info) => Ok(Verdict::new(choice, confidence, info)),
             (other, ..) => bail!("expected a choice answer, got {other:?}"),
         }
     }
@@ -290,11 +312,16 @@ impl Jev {
             .personas
             .iter()
             .map(|p| {
-                let mut d = describe(p);
+                let mut d = json!({ "who": describe(p) });
                 if p.id == team.entry {
-                    d.push_str(" (team lead / entry point, handles anything general or cross-cutting)");
+                    d["scope"] =
+                        json!("Team lead and entry point: handles anything general, cross-cutting or unclear.");
                 }
-                (p.id.clone(), json!(d))
+                // The persona's own prompt is the best description of its expertise.
+                if !p.prompt.trim().is_empty() {
+                    d["expertise"] = json!(clip(p.prompt.trim(), 600));
+                }
+                (p.id.clone(), d)
             })
             .collect();
         let state = json!({ "original_task": clip(task, 3000), "user_message": clip(content, 4000) });

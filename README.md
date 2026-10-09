@@ -84,7 +84,7 @@ existing repository. All personas of a session share this directory.
 Some orchestration steps need a judgement call, not an agent turn. Chimera hands these to
 [Jev](https://docs.typesafe.ai), TypeSafe's "System One" model. Jev answers typed questions (choice or yes/no)
 in about 100ms, at a small fraction of an LLM call's cost. Each decision appears in the session timeline with
-its outcome, confidence and latency.
+its outcome, confidence, latency and cost.
 
 | Decision | When | Effect |
 |---|---|---|
@@ -93,8 +93,14 @@ its outcome, confidence and latency.
 | **Missed `<final>`** | the entry persona replies without `<final>` and nothing else is pending | If Jev is confident the reply hands the finished result to the user, the session completes with it. Otherwise it goes idle as before. |
 | **Auto-routing** | you send a follow-up with recipient **⚡ Auto** | Jev picks the persona best suited to handle it, falling back to the entry persona. |
 
-Setup: export `TYPESAFE_API_KEY` (`JEV_API_KEY` is also accepted) for the server, then check
-**Settings → Quick decisions → Test connection**. Each decision has its own switch and confidence threshold.
+**Setup (OpenRouter, the default):** export your OpenRouter key as `JEV_API_KEY` (`OPENROUTER_API_KEY` also
+works) for the server, then press **Settings → Quick decisions → Test connection**. Requests go to
+OpenRouter's [System One API](https://openrouter.ai/docs/guides/community/typesafe-sdk)
+(`https://openrouter.ai/api/v1/systemone`) and are billed to your OpenRouter account. `jev-latest` is routed to
+`~typesafe/jev-latest`; set the model to e.g. `jev-1.13` to pin a version. To call TypeSafe directly instead,
+pick the **TypeSafe direct** provider and set `TYPESAFE_API_KEY`.
+
+Each decision has its own switch and confidence threshold.
 Decisions only adjust routing: if Jev is disabled, unreachable or unsure, Chimera behaves exactly as it would
 without it. Dry runs never call Jev.
 

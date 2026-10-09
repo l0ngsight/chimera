@@ -640,6 +640,7 @@ fn record<T>(
             confidence: Some(v.confidence),
             applied,
             latency_ms: v.latency_ms,
+            cost: v.cost,
             error: None,
         },
         Err(e) => {
@@ -651,6 +652,7 @@ fn record<T>(
                 confidence: None,
                 applied: false,
                 latency_ms: 0,
+                cost: None,
                 error: Some(format!("{e:#}")),
             }
         }
@@ -1091,7 +1093,7 @@ mod e2e_tests {
                 _ => json!({"type": "choice", "choice": "worker", "probabilities": {}, "confidence": 0.8}),
             };
             Json(
-                json!({"model": "jev-1.13.0", "answers": {"q": answer}, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+                json!({"id": "gen-dec-1", "model": "typesafe/jev-1.13-20260917", "provider": "TypeSafe", "answers": {"q": answer}, "usage": {"input_tokens": 1, "output_tokens": 1, "cost": 0.00003}}),
             )
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1165,6 +1167,8 @@ mod e2e_tests {
             assert!(kinds.contains(&DecisionKind::ResolveRecipient));
             assert!(kinds.contains(&DecisionKind::AckFilter));
             assert!(kinds.contains(&DecisionKind::DetectFinal));
+            // OpenRouter reports the cost of each call.
+            assert!(inner.events.iter().any(|e| matches!(&e.body, EventBody::Decision { cost: Some(_), .. })));
         }
 
         // "auto" routing of a follow-up picks the persona Jev chose.

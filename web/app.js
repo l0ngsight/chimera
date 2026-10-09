@@ -535,7 +535,7 @@ async function sessionPage(id) {
       h('span', { class: 'jev' }, '⚡ Jev'), ' ', h('b', {}, label), ' · ', e.subject, ': ',
       e.error ? h('span', { title: e.error }, 'skipped (' + e.error.slice(0, 120) + ')') : [
         h('b', {}, outcome),
-        e.confidence != null ? h('span', { class: 'muted' }, ` (${Math.round(e.confidence * 100)}% conf, ${e.latency_ms}ms)`) : null,
+        e.confidence != null ? h('span', { class: 'muted' }, ` (${Math.round(e.confidence * 100)}% conf, ${e.latency_ms}ms${e.cost != null ? ', $' + e.cost.toFixed(5) : ''})`) : null,
         effect,
       ]);
   }
@@ -906,6 +906,11 @@ const PRESETS = {
   'Ollama (local)': { api: 'openai', base_url: 'http://localhost:11434/v1', model: 'llama3.3', api_key_env: 'OLLAMA_API_KEY' },
 };
 
+const JEV_PROVIDERS = {
+  OpenRouter: { base_url: 'https://openrouter.ai/api/v1', api_key_env: 'JEV_API_KEY' },
+  'TypeSafe direct': { base_url: 'https://api.typesafe.ai/v1', api_key_env: 'TYPESAFE_API_KEY' },
+};
+
 /** Settings for quick orchestration decisions with Jev. */
 function jevCard(settings) {
   const d = settings.decisions;
@@ -930,7 +935,7 @@ function jevCard(settings) {
     status.className = 'small ' + (s.decisions_active ? 'muted' : 'avail no');
     status.textContent = s.decisions_active
       ? `✔ active, key read from $${s.decisions_key_env}`
-      : !s.decisions.enabled ? '✖ disabled' : `✖ no API key: set $${s.decisions.api_key_env} (or TYPESAFE_API_KEY / JEV_API_KEY) for the server`;
+      : !s.decisions.enabled ? '✖ disabled' : `✖ no API key: set $${s.decisions.api_key_env} (or JEV_API_KEY / OPENROUTER_API_KEY / TYPESAFE_API_KEY) for the server`;
   };
   showStatus(settings);
   const testOut = h('span', { class: 'muted small' });
@@ -948,7 +953,7 @@ function jevCard(settings) {
     try {
       await save();
       const r = await api('POST', '/api/decisions/test');
-      testOut.textContent = `✔ ${r.model} answered in ${r.latency_ms}ms`;
+      testOut.textContent = `✔ ${r.model} answered in ${r.latency_ms}ms` + (r.cost != null ? ` ($${r.cost.toFixed(5)})` : '');
     } catch (e) { testOut.textContent = ''; toast(e.message, true); }
   }
   const toggle = (box, text, thr, thrLabel) => h('div', { class: 'row', style: 'margin:8px 0' },
@@ -959,6 +964,10 @@ function jevCard(settings) {
     h('p', { class: 'muted small' },
       'Jev (TypeSafe’s decision model) makes cheap ~100ms calls between agent turns. Each one only adjusts routing; if Jev is off or fails, Chimera behaves as without it. Decisions appear in the session timeline. Dry runs never call Jev.'),
     status,
+    h('div', { class: 'row', style: 'margin-top:10px' }, h('span', { class: 'muted small' }, 'Provider:'),
+      Object.entries(JEV_PROVIDERS).map(([name, p]) => h('button', {
+        onclick: () => { f.base_url.value = p.base_url; f.api_key_env.value = p.api_key_env; },
+      }, name))),
     h('div', { class: 'grid', style: 'grid-template-columns: 2fr 1fr 1fr 120px; gap: 0 10px' },
       h('div', {}, h('label', {}, 'Base URL'), f.base_url),
       h('div', {}, h('label', {}, 'Model'), f.model),
