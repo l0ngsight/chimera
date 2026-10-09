@@ -134,8 +134,8 @@ Built-in defaults:
 
 | Runtime | Invocation | Output parsing |
 |---|---|---|
-| `claude` | `claude -p --model M --effort E --output-format stream-json --verbose --permission-mode bypassPermissions --no-chrome` (prompt on stdin) | text, thinking, tool calls/results, cost |
-| `codex` | `codex exec --model M -c model_reasoning_effort="E" --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -` | agent messages, reasoning, commands, file changes |
+| `claude` | `claude -p --model M --effort E --output-format stream-json --verbose --permission-mode bypassPermissions --no-chrome --disallowedTools …` (prompt on stdin) | text, thinking, tool calls/results, cost |
+| `codex` | `codex exec --model M -c model_reasoning_effort="E" --json --sandbox workspace-write --skip-git-repo-check -` (network on, approvals never) | agent messages, reasoning, commands, file changes |
 | `opencode` | `opencode run --model M --variant E --format json "<prompt>"` | text, reasoning, tool use |
 | `hermes` | `hermes chat --model M -q "<prompt>"` | plain text |
 | `mock` | built in | simulated delegation |
@@ -163,13 +163,19 @@ always allows free text.
 
 ### Security
 
-Agents run **unattended with permission prompts disabled** (`bypassPermissions`,
-`--dangerously-bypass-approvals-and-sandbox`), because nobody is there to approve them. Run Chimera in a
-container or VM, or on a machine and workspace you are comfortable letting agents modify. The server binds to
-`127.0.0.1` by default and has no authentication. Do not expose it publicly.
+Agents run **unattended without permission prompts**, because nobody is there to approve them, on a computer
+you may be using at the same time. Chimera layers these guardrails:
 
-Claude agents are started with `--no-chrome`, so an unattended agent can never drive your real browser through
-the Claude in Chrome integration, even if it is enabled in your Claude Code settings.
+| Guardrail | Applies to | Enforced by |
+|---|---|---|
+| Never kill, quit or restart programs it didn't start (browser, editors, the Chimera server); no killing by name or port; browser testing only in a headless browser with its own profile | every runtime | ground rules in every prompt |
+| `pkill`, `killall`, `kill`, `… \| xargs kill`, `osascript`, `shutdown`, `reboot` are denied (also inside pipes and `&&` chains) | Claude | `--disallowedTools` (holds even with `bypassPermissions`) |
+| No access to your real Chrome through Claude in Chrome | Claude | `--no-chrome` |
+| Shell commands run in Codex's sandbox: writes confined to the workspace, network allowed | Codex | `--sandbox workspace-write` |
+
+Prompt rules guide well-behaved agents, but a determined agent can get around them, and opencode and Hermes rely
+on them alone. For full isolation, run Chimera (and the CLIs) in a container, VM or separate OS user. The server
+binds to `127.0.0.1` by default and has no authentication. Do not expose it publicly.
 
 ## Data layout
 

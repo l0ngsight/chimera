@@ -204,6 +204,12 @@ fn group(items: &[&str]) -> ArgItem {
     ArgItem::Group(items.iter().map(|s| s.to_string()).collect())
 }
 
+/// Shell commands Claude agents may not run: they can take down programs the user is running
+/// (`pkill chrome`, `lsof -ti:PORT | xargs kill`, AppleScript `quit`). Deny rules hold even with
+/// `bypassPermissions`, including inside pipes and `&&` chains.
+pub const CLAUDE_DENIED_TOOLS: &str =
+    "Bash(pkill *),Bash(killall *),Bash(kill *),Bash(xargs kill *),Bash(osascript *),Bash(shutdown *),Bash(reboot *)";
+
 /// Built-in runtime definitions. Users can override any of them in `chimera.yaml`.
 pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
     let mut m = BTreeMap::new();
@@ -225,6 +231,9 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 one("bypassPermissions"),
                 // Unattended agents must never drive the user's real browser.
                 one("--no-chrome"),
+                // ...nor kill or quit programs they did not start (enforced even in bypass mode).
+                one("--disallowedTools"),
+                one(CLAUDE_DENIED_TOOLS),
             ],
             resume_args: Some(vec![
                 one("-p"),
@@ -238,6 +247,9 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 one("bypassPermissions"),
                 // Unattended agents must never drive the user's real browser.
                 one("--no-chrome"),
+                // ...nor kill or quit programs they did not start (enforced even in bypass mode).
+                one("--disallowedTools"),
+                one(CLAUDE_DENIED_TOOLS),
             ]),
             session: SessionMode::Preassign,
             output: OutputFormat::ClaudeStreamJson,
@@ -260,7 +272,13 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 group(&["-c", "model_reasoning_effort=\"{effort}\""]),
                 one("--json"),
                 one("--skip-git-repo-check"),
-                one("--dangerously-bypass-approvals-and-sandbox"),
+                // Sandboxed: writes confined to the workspace, network allowed for installs/tests.
+                one("--sandbox"),
+                one("workspace-write"),
+                one("-c"),
+                one("sandbox_workspace_write.network_access=true"),
+                one("-c"),
+                one("approval_policy=\"never\""),
                 one("-"),
             ],
             resume_args: None,

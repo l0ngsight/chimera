@@ -489,6 +489,37 @@ mod tests {
     }
 
     #[test]
+    fn agents_are_kept_away_from_the_users_programs() {
+        let rts = builtin_runtimes();
+        let p = persona("opus", Effort::High);
+        for resume in [false, true] {
+            let inv = Invocation {
+                spec: &rts["claude"],
+                persona: &p,
+                prompt: "hi",
+                workdir: Path::new("/tmp"),
+                native_session: Some("s"),
+                resume,
+            };
+            let (args, _) = build_args(&inv);
+            assert!(args.contains(&"--no-chrome".to_string()), "resume={resume}");
+            let denied = args.windows(2).find(|w| w[0] == "--disallowedTools").map(|w| w[1].clone());
+            assert!(denied.is_some_and(|d| d.contains("Bash(pkill *)") && d.contains("Bash(xargs kill *)")));
+        }
+        let inv = Invocation {
+            spec: &rts["codex"],
+            persona: &p,
+            prompt: "hi",
+            workdir: Path::new("/tmp"),
+            native_session: None,
+            resume: false,
+        };
+        let (args, _) = build_args(&inv);
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
+        assert!(!args.iter().any(|a| a.contains("dangerously")));
+    }
+
+    #[test]
     fn groups_with_empty_placeholders_are_dropped() {
         let rts = builtin_runtimes();
         let p = persona("", Effort::High);

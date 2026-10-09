@@ -674,6 +674,18 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
 
 const HISTORY_BUDGET: usize = 24_000;
 
+/// Included in every turn: agents run unattended on a computer someone is using.
+const GROUND_RULES: &str = "# Ground rules for this computer\n\n\
+You run unattended on a computer that a person is using at the same time.\n\
+- Only stop processes you started yourself in this session. Never kill, quit or restart other programs: \
+not the user's web browser, editors, terminals, chat apps, nor the Chimera server that runs you.\n\
+- Never use pkill/killall, never kill processes by name or by port (e.g. `lsof -ti:PORT | xargs kill`). \
+If a port is busy, use another port.\n\
+- For browser testing, use a headless browser with its own temporary profile (e.g. Playwright's bundled \
+Chromium). Never launch, restart, control or attach to the user's own Chrome, Safari or Firefox or their profiles.\n\
+- Do not change system settings, global configuration or files outside the shared directory unless the task \
+explicitly requires it.\n\n";
+
 /// Builds the prompt for one persona turn.
 pub fn build_prompt(
     meta: &SessionMeta,
@@ -762,6 +774,7 @@ pub fn build_prompt(
         let _ = writeln!(p, "## From {}\n\n{}\n", display(&m.from), m.content.trim());
     }
 
+    p.push_str(GROUND_RULES);
     let _ = writeln!(p, "# How to communicate\n");
     if resume {
         p.push_str(&roster(team, persona));
@@ -906,6 +919,49 @@ async fn run_mock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_prompt_carries_the_ground_rules() {
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: mock}\n").unwrap();
+        let meta = SessionMeta {
+            id: "s".into(),
+            title: "t".into(),
+            task: "do it".into(),
+            agents: team
+                .personas
+                .iter()
+                .map(|p| {
+                    (
+                        p.id.clone(),
+                        AgentState {
+                            status: AgentStatus::Idle,
+                            turns: 0,
+                            native_session: None,
+                            history: vec![],
+                            notes: vec![],
+                            inbox: vec![],
+                        },
+                    )
+                })
+                .collect(),
+            team: team.clone(),
+            workdir: PathBuf::from("/tmp"),
+            dry_run: false,
+            status: SessionStatus::Running,
+            status_detail: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            round_turns: 0,
+            total_turns: 0,
+            final_answer: None,
+        };
+        let msg = [InboxMessage { from: USER.into(), content: "go".into(), wake: true }];
+        for resume in [false, true] {
+            let prompt = build_prompt(&meta, &team.personas[0], &msg, &[], resume);
+            assert!(prompt.contains("Never use pkill/killall"), "resume={resume}");
+        }
+    }
 
     #[test]
     fn parses_messages_and_final() {
