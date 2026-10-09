@@ -296,8 +296,9 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::from([("minimal".into(), "low".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
-            // Codex sandboxes its own commands (seatbelt on macOS); sandboxes cannot be nested.
-            guard: false,
+            // On macOS Codex applies its own seatbelt sandbox (which already blocks outside
+            // signals) and seatbelt sandboxes cannot be nested. On Linux nesting works.
+            guard: !cfg!(target_os = "macos"),
             models_source: ModelsSource::Command {
                 args: vec!["debug".into(), "models".into()],
                 format: ModelsFormat::CodexCatalog,

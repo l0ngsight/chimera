@@ -46,8 +46,8 @@ pub struct Invocation<'a> {
     /// Native session to resume (`Some`) or to create (preassigned id for a fresh session).
     pub native_session: Option<&'a str>,
     pub resume: bool,
-    /// Process-guard wrapper (program + leading args) when the guard is active.
-    pub wrapper: Option<(String, Vec<String>)>,
+    /// Process-guard sandbox to run the CLI in, when the guard is active.
+    pub wrapper: Option<crate::guard::Backend>,
 }
 
 /// Expands the argument templates for an invocation.
@@ -135,10 +135,11 @@ pub async fn run_process(
     let (args, prompt_in_args) = build_args(&inv);
     let mut shown = describe_command(&spec.command, &args, inv.prompt);
     // Under the process guard the CLI runs inside an OS sandbox: `<wrapper> <command> <args…>`.
-    let (program, args) = match inv.wrapper.as_ref().filter(|_| spec.guard) {
-        Some((program, prefix)) => {
-            shown = format!("[process guard] {shown}");
-            (program.clone(), prefix.iter().cloned().chain([spec.command.clone()]).chain(args).collect())
+    let guard = inv.wrapper.as_ref().filter(|_| spec.guard);
+    let (program, args) = match guard {
+        Some(b) => {
+            shown = format!("[process guard: {}] {shown}", b.name);
+            (b.program.clone(), b.args.iter().cloned().chain([spec.command.clone()]).chain(args).collect())
         }
         None => (spec.command.clone(), args),
     };
@@ -151,6 +152,9 @@ pub async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for var in guard.map(|b| b.hidden_env).unwrap_or_default() {
+        cmd.env_remove(var);
+    }
     for (k, v) in spec.env.iter().chain(inv.persona.env.iter()) {
         cmd.env(k, v);
     }
@@ -659,7 +663,13 @@ mod tests {
                     workdir: Path::new("."),
                     native_session: None,
                     resume: false,
-                    wrapper: Some(("env".into(), vec![])),
+                    wrapper: Some(crate::guard::Backend {
+                        name: "env",
+                        program: "env".into(),
+                        args: vec![],
+                        hidden_env: &[],
+                        covers: "test",
+                    }),
                 },
                 tx,
                 crx,
@@ -667,7 +677,7 @@ mod tests {
             .await;
             assert_eq!(out.text, "guarded");
             let cmd = rx.recv().await.unwrap().text;
-            assert_eq!(cmd.starts_with("[process guard]"), expect_prefix, "{cmd}");
+            assert_eq!(cmd.starts_with("[process guard: env]"), expect_prefix, "{cmd}");
         }
     }
 }

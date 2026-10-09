@@ -3,66 +3,122 @@
 //!
 //! Prompt rules and per-CLI deny lists are advisory or partial; an agent can still run
 //! `pkill chrome`, `lsof -ti:PORT | xargs kill` or a script that sends signals. The guard enforces
-//! it at the OS level for every runtime.
+//! it at the OS level for every runtime:
 //!
-//! macOS: `sandbox-exec` with a profile that allows everything except sending signals outside the
-//! sandbox and sending Apple Events (AppleScript `quit`). Processes the agent starts inherit the
-//! sandbox, so agents can still stop their own dev servers. The profile is verified on the actual
-//! machine at startup; if the check fails the guard reports why and stays off.
+//! - **Linux**: a private PID namespace (bubblewrap, or util-linux `unshare`). The agent only sees
+//!   processes it started, so there is nothing else to signal. When the agent exits or is
+//!   cancelled, everything it left running is killed with it. `DISPLAY`/`WAYLAND_DISPLAY` are
+//!   removed so it cannot close windows through the display server either.
+//! - **macOS**: `sandbox-exec` with a profile that denies signals outside the sandbox and Apple
+//!   Events (AppleScript `quit`).
+//!
+//! Each backend is verified on the actual machine at startup (the sandbox starts, cannot signal a
+//! process outside it, and can still stop its own child). The first backend that passes is used;
+//! if none does, the guard reports why and stays off.
 
+use std::process::Stdio;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
-/// Seatbelt profile. Later rules win: signals are denied, then re-allowed within the sandbox.
-const SIGNALS: &str = "(version 1)\n\
-(allow default)\n\
-(deny signal)\n\
-(allow signal (target same-sandbox))\n";
-
-/// Also blocks Apple Events (AppleScript `tell application "Google Chrome" to quit`).
-pub const PROFILE: &str = concat!(
+/// macOS seatbelt profile. Later rules win: signals are denied, then re-allowed within the sandbox.
+pub const MACOS_PROFILE: &str = concat!(
     "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n",
     "(deny appleevent-send)\n"
 );
+const MACOS_SIGNALS_ONLY: &str = "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n";
 
-/// Profiles tried in order by the self-test; the first that passes is used.
-const CANDIDATES: &[(&str, &str)] =
-    &[(PROFILE, "signals and Apple Events blocked"), (SIGNALS, "signals blocked (Apple Events rule unsupported)")];
+/// Environment variables removed from guarded processes on Linux: without them an agent cannot
+/// close the user's windows through X11/Wayland (`xdotool … windowclose`, `wmctrl -c`).
+const LINUX_HIDDEN_ENV: &[&str] = &["DISPLAY", "WAYLAND_DISPLAY"];
+
+/// One way of sandboxing a command: `program args… <command> <command args…>`.
+#[derive(Debug, Clone)]
+pub struct Backend {
+    pub name: &'static str,
+    pub program: String,
+    pub args: Vec<String>,
+    pub hidden_env: &'static [&'static str],
+    /// What it protects, for the status line.
+    pub covers: &'static str,
+}
+
+fn s(v: &[&str]) -> Vec<String> {
+    v.iter().map(|x| x.to_string()).collect()
+}
+
+/// Backends to try on this OS, best first.
+pub fn platform_backends() -> Vec<Backend> {
+    if cfg!(target_os = "linux") {
+        vec![
+            Backend {
+                name: "bubblewrap",
+                program: "bwrap".into(),
+                args: s(&["--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--"]),
+                hidden_env: LINUX_HIDDEN_ENV,
+                covers: "private process namespace via bubblewrap",
+            },
+            Backend {
+                name: "unshare",
+                program: "unshare".into(),
+                args: s(&["--user", "--map-current-user", "--pid", "--fork", "--mount-proc", "--kill-child"]),
+                hidden_env: LINUX_HIDDEN_ENV,
+                covers: "private process namespace via unshare",
+            },
+        ]
+    } else if cfg!(target_os = "macos") {
+        vec![
+            Backend {
+                name: "sandbox-exec",
+                program: "/usr/bin/sandbox-exec".into(),
+                args: vec!["-p".into(), MACOS_PROFILE.into()],
+                hidden_env: &[],
+                covers: "signals and Apple Events blocked via sandbox-exec",
+            },
+            Backend {
+                name: "sandbox-exec (signals only)",
+                program: "/usr/bin/sandbox-exec".into(),
+                args: vec!["-p".into(), MACOS_SIGNALS_ONLY.into()],
+                hidden_env: &[],
+                covers: "signals blocked via sandbox-exec (Apple Events rule unsupported)",
+            },
+        ]
+    } else {
+        vec![]
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GuardStatus {
-    /// The sandbox works on this machine (self-test passed).
+    /// A backend passed the self-test on this machine.
     pub available: bool,
     /// The user wants it on.
     pub enabled: bool,
+    /// Backend in use, if any.
+    pub backend: Option<String>,
     /// Human-readable result of the self-test.
     pub detail: String,
 }
 
 pub struct Guard {
     enabled: AtomicBool,
-    available: AtomicBool,
+    candidates: Vec<Backend>,
+    active: RwLock<Option<Backend>>,
     detail: RwLock<String>,
-    profile: RwLock<String>,
-    program: String,
 }
 
 impl Guard {
     pub fn new(enabled: bool) -> Self {
-        Self::with_program(enabled, SANDBOX_EXEC)
+        Self::with_backends(enabled, platform_backends())
     }
 
-    fn with_program(enabled: bool, program: &str) -> Self {
+    pub fn with_backends(enabled: bool, candidates: Vec<Backend>) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
-            available: AtomicBool::new(false),
+            candidates,
+            active: RwLock::new(None),
             detail: RwLock::new("not checked yet".into()),
-            profile: RwLock::new(PROFILE.to_string()),
-            program: program.to_string(),
         }
     }
 
@@ -71,146 +127,171 @@ impl Guard {
     }
 
     pub fn status(&self) -> GuardStatus {
+        let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         GuardStatus {
-            available: self.available.load(Ordering::Relaxed),
+            available: active.is_some(),
             enabled: self.enabled.load(Ordering::Relaxed),
+            backend: active.as_ref().map(|b| b.name.to_string()),
             detail: self.detail.read().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 
-    /// Program and leading arguments to run a guarded command, when the guard is active.
-    pub fn wrapper(&self) -> Option<(String, Vec<String>)> {
-        (self.enabled.load(Ordering::Relaxed) && self.available.load(Ordering::Relaxed)).then(|| {
-            (
-                self.program.clone(),
-                vec!["-p".to_string(), self.profile.read().unwrap_or_else(|e| e.into_inner()).clone()],
-            )
-        })
+    /// The backend to wrap agent commands with, when the guard is on and verified.
+    pub fn wrapper(&self) -> Option<Backend> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.active.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn set(&self, available: bool, detail: impl Into<String>) {
-        self.available.store(available, Ordering::Relaxed);
-        *self.detail.write().unwrap_or_else(|e| e.into_inner()) = detail.into();
+    fn set(&self, active: Option<Backend>, detail: String) {
+        *self.active.write().unwrap_or_else(|e| e.into_inner()) = active;
+        *self.detail.write().unwrap_or_else(|e| e.into_inner()) = detail;
     }
 
-    /// Checks on this machine that the sandbox (1) starts, (2) blocks signals to an outside
-    /// process (this server), and (3) still lets the agent stop processes it started itself.
+    /// Picks the first backend that passes the checks on this machine.
     pub async fn self_test(&self) {
-        if !cfg!(target_os = "macos") {
+        if self.candidates.is_empty() {
             self.set(
-                false,
-                "Only available on macOS; on other systems run Chimera in a container or VM for isolation.",
+                None,
+                "Not available on this operating system; run Chimera in a container or VM for isolation.".into(),
             );
             return;
         }
         let mut errors = vec![];
-        for (profile, what) in CANDIDATES {
-            match self.run_checks(profile).await {
+        for b in &self.candidates {
+            match check(b).await {
                 Ok(()) => {
-                    *self.profile.write().unwrap_or_else(|e| e.into_inner()) = profile.to_string();
                     self.set(
-                        true,
-                        format!("verified on this Mac ({what}): agents cannot kill or quit programs outside their sandbox, and can still stop their own processes"),
+                        Some(b.clone()),
+                        format!(
+                            "Verified on this machine ({}): agents cannot kill or quit programs they did not start, and can still stop their own.",
+                            b.covers
+                        ),
                     );
                     return;
                 }
-                Err(e) => errors.push(e),
+                Err(e) => errors.push(format!("{}: {e}", b.name)),
             }
         }
-        let e = errors.join("; ");
-        tracing::warn!("process guard unavailable: {e}");
-        self.set(false, format!("Self-test failed, so the guard is off: {e}"));
+        let mut detail = format!("Self-test failed, so the guard is off. {}", errors.join("; "));
+        if cfg!(target_os = "linux") {
+            detail.push_str(
+                " Install bubblewrap (e.g. `sudo apt install bubblewrap` or `sudo dnf install bubblewrap`) and restart Chimera.",
+            );
+        }
+        tracing::warn!("process guard unavailable: {detail}");
+        self.set(None, detail);
+    }
+}
+
+/// The sandbox must (1) run a command, (2) be unable to signal a process outside it and
+/// (3) still be able to stop a process it started itself.
+async fn check(b: &Backend) -> Result<(), String> {
+    let run = |script: String| {
+        let b = b.clone();
+        async move {
+            tokio::process::Command::new(&b.program)
+                .args(&b.args)
+                .args(["/bin/sh", "-c", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| format!("could not run `{}`: {e}", b.program))
+        }
+    };
+    let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).trim().to_string();
+
+    let out = run("exit 0".into()).await?;
+    if !out.status.success() {
+        return Err(format!("sandbox did not start: {}", stderr(&out)));
     }
 
-    async fn run_checks(&self, profile: &str) -> Result<(), String> {
-        let me = std::process::id();
-        let run = |script: String| {
-            let program = self.program.clone();
-            let profile = profile.to_string();
-            async move {
-                tokio::process::Command::new(program)
-                    .args(["-p", &profile, "/bin/sh", "-c", &script])
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .await
-                    .map_err(|e| format!("could not run sandbox-exec: {e}"))
-            }
-        };
-        let out = run("exit 0".into()).await?;
-        if !out.status.success() {
-            return Err(format!("sandbox did not start: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
-        // Signal 0 only checks permission; it never affects the target.
-        let out = run(format!("kill -0 {me}")).await?;
-        if out.status.success() {
-            return Err("a sandboxed process could still signal an outside process".into());
-        }
-        let out = run("sleep 30 & pid=$!; kill $pid && wait $pid; exit 0".into()).await?;
-        if !out.status.success() {
-            return Err(format!(
-                "a sandboxed process could not stop its own child: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
+    // A real outside process to aim at; signal 0 only checks permission and never affects it.
+    let mut target = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("could not start a test process: {e}"))?;
+    let pid = target.id().ok_or("test process has no pid")?;
+    let out = run(format!("kill -0 {pid}")).await;
+    let _ = target.start_kill();
+    if out?.status.success() {
+        return Err("a sandboxed process could still signal a process outside the sandbox".into());
     }
 
-    /// Test hook: mark the guard as verified without running the self-test.
-    #[cfg(test)]
-    pub fn assume_available(program: &str) -> Self {
-        let g = Self::with_program(true, program);
-        g.set(true, "assumed for tests");
-        g
+    let out = run("sleep 30 & p=$!; kill $p; wait $p; exit 0".into()).await?;
+    if !out.status.success() {
+        return Err(format!("a sandboxed process could not stop its own child: {}", stderr(&out)));
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn profile_blocks_outside_signals_and_apple_events() {
-        assert!(PROFILE.contains("(deny signal)"));
-        assert!(PROFILE.contains("(allow signal (target same-sandbox))"));
-        assert!(PROFILE.contains("(deny appleevent-send)"));
-        // Order matters in seatbelt profiles: the re-allow must come after the deny.
-        assert!(PROFILE.find("(deny signal)") < PROFILE.find("(allow signal"));
+    fn backend(program: &str, args: &[&str]) -> Backend {
+        Backend { name: "test", program: program.into(), args: s(args), hidden_env: &[], covers: "test" }
     }
 
     #[test]
-    fn wrapper_only_when_enabled_and_verified() {
-        let g = Guard::new(true);
-        assert!(g.wrapper().is_none(), "not verified yet");
-        let g = Guard::assume_available("/usr/bin/sandbox-exec");
-        assert_eq!(g.wrapper().unwrap().0, "/usr/bin/sandbox-exec");
-        g.set_enabled(false);
+    fn macos_profile_blocks_outside_signals_and_apple_events() {
+        assert!(MACOS_PROFILE.contains("(deny signal)"));
+        assert!(MACOS_PROFILE.contains("(allow signal (target same-sandbox))"));
+        assert!(MACOS_PROFILE.contains("(deny appleevent-send)"));
+        // Order matters in seatbelt profiles: the re-allow must come after the deny.
+        assert!(MACOS_PROFILE.find("(deny signal)") < MACOS_PROFILE.find("(allow signal"));
+    }
+
+    /// A "sandbox" that does not isolate anything must fail, so the guard never claims to
+    /// protect the user when it does not.
+    #[tokio::test]
+    async fn a_non_isolating_wrapper_fails_the_self_test() {
+        let g = Guard::with_backends(true, vec![backend("env", &[])]);
+        g.self_test().await;
+        let st = g.status();
+        assert!(!st.available, "{}", st.detail);
+        assert!(st.detail.contains("could still signal"), "{}", st.detail);
         assert!(g.wrapper().is_none());
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
-    async fn self_test_reports_unsupported_off_macos() {
-        let g = Guard::new(true);
+    async fn missing_backends_are_reported_and_skipped() {
+        let g = Guard::with_backends(true, vec![backend("/nonexistent/sandbox", &[])]);
         g.self_test().await;
-        let s = g.status();
-        assert!(!s.available);
-        assert!(s.detail.contains("macOS"));
+        assert!(!g.status().available);
+        assert!(g.status().detail.contains("could not run"));
     }
 
-    /// A "sandbox" that does not sandbox anything must fail the self-test, so the guard is never
-    /// reported as protecting the user when it isn't.
-    #[cfg(unix)]
+    /// Runs the real Linux backends when this machine supports them (bubblewrap or user
+    /// namespaces); skipped silently where neither works, e.g. some CI containers.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn self_test_rejects_a_sandbox_that_does_not_block_signals() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("chimera-guard-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("sandbox-exec");
-        // Ignores `-p PROFILE` and runs the command unsandboxed.
-        std::fs::write(&fake, "#!/bin/sh\nshift 2\nexec \"$@\"\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let g = Guard::with_program(true, fake.to_str().unwrap());
-        let err = g.run_checks(PROFILE).await.unwrap_err();
-        assert!(err.contains("could still signal"), "{err}");
+    async fn linux_guard_isolates_processes_when_supported() {
+        let g = Guard::new(true);
+        g.self_test().await;
+        let st = g.status();
+        if !st.available {
+            eprintln!("skipping: {}", st.detail);
+            return;
+        }
+        let b = g.wrapper().unwrap();
+        // pkill/killall inside the sandbox must not reach a process outside it.
+        let mut outside = tokio::process::Command::new("sleep").arg("60").kill_on_drop(true).spawn().unwrap();
+        let status = tokio::process::Command::new(&b.program)
+            .args(&b.args)
+            .args(["/bin/sh", "-c", "pkill -x sleep; killall sleep; exit 0"])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert!(outside.try_wait().unwrap().is_none(), "outside process was killed from inside the sandbox");
+        let _ = outside.start_kill();
+        g.set_enabled(false);
+        assert!(g.wrapper().is_none());
     }
 }

@@ -33,7 +33,7 @@ On first start Chimera writes the sample **Software Development Team** to `data/
 Open the UI, choose the team, enter a task and press **Start session**. Tick **Dry run** to try it without any
 agent CLIs installed.
 
-Requirements: install and log in to the CLIs your personas use (`claude`, `codex`, `opencode`, `hermes`).
+Requirements: install and log in to the CLIs your personas use (`claude`, `codex`, `opencode`, `hermes`). On Linux, also install bubblewrap (`bwrap`) so the process guard can keep agents away from your other programs.
 **Settings → Agent runtimes** shows which of them are on the server's `PATH`. To generate persona prompts,
 export the API key named in Settings (by default `DEEPSEEK_API_KEY`).
 
@@ -168,14 +168,15 @@ you may be using at the same time. Chimera layers these guardrails:
 
 | Guardrail | Applies to | Enforced by |
 |---|---|---|
-| **Process guard**: the agent cannot send signals to, or AppleScript, any program outside its sandbox, so it cannot kill or quit your browser, editors or the Chimera server; it can still stop processes it started | Claude, opencode, Hermes (macOS) | `sandbox-exec`, verified by a self-test at startup; status and switch in **Settings → Process guard** |
+| **Process guard**: the agent cannot kill or quit any program it did not start (your browser, editors, the Chimera server) but can still stop its own processes | every runtime (on macOS Codex uses its own sandbox) | **Linux**: private PID namespace via bubblewrap (`bwrap`), falling back to `unshare`; the agent cannot see other processes, `DISPLAY`/`WAYLAND_DISPLAY` are removed, and whatever it leaves running is stopped with it. **macOS**: `sandbox-exec`. Verified by a self-test at startup; status and switch in **Settings → Process guard** |
 | Never kill, quit or restart programs it didn't start (browser, editors, the Chimera server); no killing by name or port; browser testing only in a headless browser with its own profile | every runtime | ground rules in every prompt |
 | `pkill`, `killall`, `kill`, `… \| xargs kill`, `osascript`, `shutdown`, `reboot` are denied (also inside pipes and `&&` chains) | Claude | `--disallowedTools` (holds even with `bypassPermissions`) |
 | No access to your real Chrome through Claude in Chrome | Claude | `--no-chrome` |
 | Shell commands run in Codex's sandbox: writes confined to the workspace, network allowed, signals only within the sandbox | Codex | `--sandbox workspace-write` (macOS sandboxes can't be nested, so Codex uses its own instead of the process guard) |
 
-The process guard is on by default and needs no configuration. If its self-test fails (or on Linux, where it is
-not available), the new-session form shows a warning. It protects your running programs, not your files: agents
+The process guard is on by default and needs no configuration. On Linux it needs bubblewrap
+(`sudo apt install bubblewrap` / `sudo dnf install bubblewrap`) or unprivileged user namespaces for `unshare`. If
+its self-test fails, Settings says why and the new-session form shows a warning. It protects your running programs, not your files: agents
 can still read and write anything your user can. For full isolation, run Chimera (and the CLIs) in a container,
 VM or separate OS user. The server
 binds to `127.0.0.1` by default and has no authentication. Do not expose it publicly.

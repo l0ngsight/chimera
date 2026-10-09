@@ -1072,7 +1072,7 @@ function guardCard(settings) {
   return h('div', { class: 'card', style: 'grid-column: 1 / -1' },
     h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, '🛡 Process guard'), h('label', { class: 'inline' }, box, 'Enabled')),
     h('p', { class: 'muted small' },
-      'Agents run shell commands without asking. The guard runs every agent CLI inside a macOS sandbox (sandbox-exec) that blocks sending signals to, or scripting, any program outside the sandbox — so an agent cannot kill or quit your browser, editors or this server, but can still stop the processes it started. Codex uses its own sandbox instead. Checked on this machine at startup.'),
+      'Agents run shell commands without asking. The guard runs every agent inside an OS sandbox so it cannot kill or quit programs it did not start — your browser, editors, this server — while it can still stop its own processes. Linux: a private process namespace (bubblewrap, or unshare); the agent cannot even see your other programs, and anything it leaves running is stopped with it. macOS: sandbox-exec. Checked on this machine at startup.'),
     state);
 }
 
