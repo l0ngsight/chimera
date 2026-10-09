@@ -1,0 +1,594 @@
+//! Launching agent CLIs and turning their output into log lines and a final answer.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::{mpsc, watch};
+
+use crate::config::{ArgItem, OutputFormat, RuntimeSpec, SessionMode};
+use crate::model::Persona;
+use crate::session::LogKind;
+
+/// One line for the persona's live log.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub kind: LogKind,
+    pub text: String,
+}
+
+impl LogLine {
+    fn new(kind: LogKind, text: impl Into<String>) -> Self {
+        Self { kind, text: text.into() }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TurnOutput {
+    /// The agent's final textual answer for this turn.
+    pub text: String,
+    /// Native session id to resume next turn, if the runtime supports it.
+    pub native_session: Option<String>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+}
+
+/// Inputs for one invocation of a process runtime.
+pub struct Invocation<'a> {
+    pub spec: &'a RuntimeSpec,
+    pub persona: &'a Persona,
+    pub prompt: &'a str,
+    pub workdir: &'a Path,
+    /// Native session to resume (`Some`) or to create (preassigned id for a fresh session).
+    pub native_session: Option<&'a str>,
+    pub resume: bool,
+}
+
+/// Expands the argument templates for an invocation.
+pub fn build_args(inv: &Invocation<'_>) -> (Vec<String>, bool) {
+    let spec = inv.spec;
+    let effort = inv.persona.effort.as_str();
+    let effort = spec.effort_map.get(effort).map(String::as_str).unwrap_or(effort);
+    let mut vars: BTreeMap<&str, &str> = BTreeMap::new();
+    vars.insert("model", inv.persona.model.as_str());
+    vars.insert("effort", effort);
+    vars.insert("prompt", inv.prompt);
+    let workdir = inv.workdir.to_string_lossy();
+    vars.insert("workdir", &workdir);
+    vars.insert("native_session", inv.native_session.unwrap_or(""));
+
+    let template = match (&spec.resume_args, inv.resume) {
+        (Some(r), true) => r,
+        _ => &spec.args,
+    };
+    let mut prompt_in_args = false;
+    let mut out = Vec::new();
+    for item in template {
+        let parts: Vec<&String> = match item {
+            ArgItem::One(s) => vec![s],
+            ArgItem::Group(g) => g.iter().collect(),
+        };
+        let mut expanded = Vec::with_capacity(parts.len());
+        let mut drop_group = false;
+        for p in parts {
+            if p.contains("{prompt}") {
+                prompt_in_args = true;
+            }
+            let (s, had_empty) = substitute(p, &vars);
+            if had_empty && matches!(item, ArgItem::Group(_)) {
+                drop_group = true;
+            }
+            expanded.push(s);
+        }
+        if !drop_group {
+            out.extend(expanded);
+        }
+    }
+    out.extend(inv.persona.extra_args.iter().cloned());
+    (out, prompt_in_args)
+}
+
+/// Replaces `{name}` placeholders. Returns whether any placeholder expanded to "".
+fn substitute(template: &str, vars: &BTreeMap<&str, &str>) -> (String, bool) {
+    let mut out = String::with_capacity(template.len());
+    let mut had_empty = false;
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        let Some(len) = rest[start..].find('}') else { break };
+        let name = &rest[start + 1..start + len];
+        if let Some(v) = vars.get(name) {
+            out.push_str(&rest[..start]);
+            out.push_str(v);
+            had_empty |= v.is_empty();
+        } else {
+            out.push_str(&rest[..start + len + 1]);
+        }
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    (out, had_empty)
+}
+
+/// Human-readable command line for the log (prompt elided).
+pub fn describe_command(command: &str, args: &[String], prompt: &str) -> String {
+    let shown: Vec<String> = args
+        .iter()
+        .map(|a| if !prompt.is_empty() && a == prompt { "<prompt>".to_string() } else { a.clone() })
+        .map(|a| shlex::try_quote(&a).map(|c| c.into_owned()).unwrap_or(a))
+        .collect();
+    format!("{command} {}", shown.join(" "))
+}
+
+/// Runs a process runtime to completion, streaming log lines through `log`.
+pub async fn run_process(
+    inv: Invocation<'_>,
+    log: mpsc::UnboundedSender<LogLine>,
+    mut cancel: watch::Receiver<bool>,
+) -> TurnOutput {
+    let spec = inv.spec;
+    let (args, prompt_in_args) = build_args(&inv);
+    let _ = log.send(LogLine::new(LogKind::Command, describe_command(&spec.command, &args, inv.prompt)));
+
+    let mut cmd = Command::new(&spec.command);
+    cmd.args(&args)
+        .current_dir(inv.workdir)
+        .stdin(if prompt_in_args { Stdio::null() } else { Stdio::piped() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in spec.env.iter().chain(inv.persona.env.iter()) {
+        cmd.env(k, v);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("failed to start `{}`: {e}", spec.command);
+            let _ = log.send(LogLine::new(LogKind::Error, msg.clone()));
+            return TurnOutput { error: Some(msg), ..Default::default() };
+        }
+    };
+
+    if !prompt_in_args && let Some(mut stdin) = child.stdin.take() {
+        let prompt = inv.prompt.to_owned();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_log = log.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut tail = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let _ = stderr_log.send(LogLine::new(LogKind::Stderr, line.clone()));
+            tail.push(line);
+            if tail.len() > 20 {
+                tail.remove(0);
+            }
+        }
+        tail.join("\n")
+    });
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut parser = OutputParser::new(spec.output);
+    let mut lines = BufReader::new(stdout).lines();
+    let timeout = tokio::time::sleep(Duration::from_secs(spec.timeout_secs.max(1)));
+    tokio::pin!(timeout);
+
+    let mut aborted: Option<String> = None;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => {
+                    for l in parser.feed(&line) {
+                        let _ = log.send(l);
+                    }
+                }
+                _ => break,
+            },
+            _ = &mut timeout => {
+                aborted = Some(format!("timed out after {}s", spec.timeout_secs));
+                break;
+            }
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    aborted = Some("cancelled".into());
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(reason) = &aborted {
+        let _ = child.start_kill();
+        let _ = log.send(LogLine::new(LogKind::Error, format!("process {reason}")));
+    }
+    let status = child.wait().await.ok();
+    let stderr_tail = stderr_task.await.unwrap_or_default();
+    let exit_code = status.and_then(|s| s.code());
+
+    let mut out = parser.finish();
+    out.exit_code = exit_code;
+    if out.native_session.is_none() && spec.session == SessionMode::Preassign {
+        out.native_session = inv.native_session.map(str::to_owned);
+    }
+    if let Some(reason) = aborted {
+        out.error = Some(reason);
+    } else if !status.map(|s| s.success()).unwrap_or(false) && out.error.is_none() {
+        let mut msg = format!("`{}` exited with {:?}", spec.command, exit_code);
+        if !stderr_tail.is_empty() {
+            msg.push_str(": ");
+            msg.push_str(&truncate(&stderr_tail, 1500));
+        }
+        out.error = Some(msg);
+    }
+    out
+}
+
+/// Incremental parser for a runtime's stdout.
+pub struct OutputParser {
+    format: OutputFormat,
+    text: String,
+    last_message: String,
+    native_session: Option<String>,
+    error: Option<String>,
+}
+
+impl OutputParser {
+    pub fn new(format: OutputFormat) -> Self {
+        Self { format, text: String::new(), last_message: String::new(), native_session: None, error: None }
+    }
+
+    pub fn feed(&mut self, line: &str) -> Vec<LogLine> {
+        if self.format == OutputFormat::Text {
+            self.text.push_str(line);
+            self.text.push('\n');
+            return vec![LogLine::new(LogKind::Text, line)];
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            if line.trim().is_empty() {
+                return vec![];
+            }
+            return vec![LogLine::new(LogKind::Text, line)];
+        };
+        match self.format {
+            OutputFormat::ClaudeStreamJson => self.feed_claude(&v),
+            OutputFormat::CodexJson => self.feed_codex(&v),
+            OutputFormat::OpencodeJson => self.feed_opencode(&v),
+            OutputFormat::Text => unreachable!(),
+        }
+    }
+
+    pub fn finish(self) -> TurnOutput {
+        let text = match self.format {
+            OutputFormat::Text => self.text.trim().to_string(),
+            OutputFormat::OpencodeJson => self.text.trim().to_string(),
+            _ if !self.text.trim().is_empty() => self.text.trim().to_string(),
+            _ => self.last_message.trim().to_string(),
+        };
+        TurnOutput { text, native_session: self.native_session, exit_code: None, error: self.error }
+    }
+
+    fn feed_claude(&mut self, v: &Value) -> Vec<LogLine> {
+        let mut out = vec![];
+        match v["type"].as_str().unwrap_or_default() {
+            "system" if v["subtype"] == "init" => {
+                if let Some(id) = v["session_id"].as_str() {
+                    self.native_session = Some(id.to_string());
+                }
+                out.push(LogLine::new(
+                    LogKind::Info,
+                    format!("session started (model: {})", v["model"].as_str().unwrap_or("?")),
+                ));
+            }
+            "assistant" => {
+                for c in v["message"]["content"].as_array().into_iter().flatten() {
+                    match c["type"].as_str().unwrap_or_default() {
+                        "text" => {
+                            let t = c["text"].as_str().unwrap_or_default();
+                            self.last_message = t.to_string();
+                            out.push(LogLine::new(LogKind::Text, t));
+                        }
+                        "thinking" => {
+                            let t = c["thinking"].as_str().unwrap_or_default();
+                            if !t.is_empty() {
+                                out.push(LogLine::new(LogKind::Thinking, t));
+                            }
+                        }
+                        "tool_use" => out.push(LogLine::new(
+                            LogKind::Tool,
+                            format!("{} {}", c["name"].as_str().unwrap_or("tool"), summarize_json(&c["input"])),
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            "user" => {
+                for c in v["message"]["content"].as_array().into_iter().flatten() {
+                    if c["type"] == "tool_result" {
+                        let body = match &c["content"] {
+                            Value::String(s) => s.clone(),
+                            Value::Array(parts) => {
+                                parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n")
+                            }
+                            other => other.to_string(),
+                        };
+                        let kind = if c["is_error"] == true { LogKind::Error } else { LogKind::ToolResult };
+                        out.push(LogLine::new(kind, truncate(&body, 2000)));
+                    }
+                }
+            }
+            "result" => {
+                if let Some(r) = v["result"].as_str() {
+                    self.text = r.to_string();
+                }
+                if v["is_error"] == true {
+                    self.error = Some(v["result"].as_str().unwrap_or("claude reported an error").to_string());
+                }
+                let cost = v["total_cost_usd"].as_f64().map(|c| format!(", cost ${c:.4}")).unwrap_or_default();
+                let turns = v["num_turns"].as_u64().map(|n| format!(", {n} turns")).unwrap_or_default();
+                out.push(LogLine::new(
+                    LogKind::Info,
+                    format!("finished: {}{turns}{cost}", v["subtype"].as_str().unwrap_or("done")),
+                ));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn feed_codex(&mut self, v: &Value) -> Vec<LogLine> {
+        let mut out = vec![];
+        match v["type"].as_str().unwrap_or_default() {
+            "thread.started" => {
+                if let Some(id) = v["thread_id"].as_str() {
+                    self.native_session = Some(id.to_string());
+                }
+                out.push(LogLine::new(LogKind::Info, "thread started"));
+            }
+            "item.started" => {
+                let item = &v["item"];
+                if item["type"] == "command_execution" {
+                    out.push(LogLine::new(LogKind::Tool, format!("$ {}", item["command"].as_str().unwrap_or(""))));
+                }
+            }
+            "item.completed" => {
+                let item = &v["item"];
+                match item["type"].as_str().unwrap_or_default() {
+                    "agent_message" => {
+                        let t = item["text"].as_str().unwrap_or_default();
+                        self.last_message = t.to_string();
+                        out.push(LogLine::new(LogKind::Text, t));
+                    }
+                    "reasoning" => out.push(LogLine::new(LogKind::Thinking, item["text"].as_str().unwrap_or_default())),
+                    "command_execution" => out.push(LogLine::new(
+                        LogKind::ToolResult,
+                        format!(
+                            "exit {}: {}",
+                            item["exit_code"],
+                            truncate(item["aggregated_output"].as_str().unwrap_or_default(), 2000)
+                        ),
+                    )),
+                    "file_change" => {
+                        let files: Vec<String> = item["changes"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|c| {
+                                format!("{} {}", c["kind"].as_str().unwrap_or("edit"), c["path"].as_str().unwrap_or(""))
+                            })
+                            .collect();
+                        out.push(LogLine::new(LogKind::Tool, format!("files: {}", files.join(", "))));
+                    }
+                    "error" => out.push(LogLine::new(LogKind::Error, item["message"].as_str().unwrap_or_default())),
+                    other => out.push(LogLine::new(LogKind::Tool, format!("{other} {}", summarize_json(item)))),
+                }
+            }
+            "turn.completed" => {
+                out.push(LogLine::new(LogKind::Info, format!("turn completed {}", summarize_json(&v["usage"]))))
+            }
+            "turn.failed" | "error" => {
+                let msg = v["error"]["message"].as_str().or(v["message"].as_str()).unwrap_or("codex error");
+                self.error = Some(msg.to_string());
+                out.push(LogLine::new(LogKind::Error, msg));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn feed_opencode(&mut self, v: &Value) -> Vec<LogLine> {
+        let part = &v["part"];
+        match v["type"].as_str().unwrap_or_default() {
+            "text" => {
+                let t = part["text"].as_str().unwrap_or_default();
+                self.text.push_str(t);
+                self.text.push('\n');
+                vec![LogLine::new(LogKind::Text, t)]
+            }
+            "reasoning" => vec![LogLine::new(LogKind::Thinking, part["text"].as_str().unwrap_or_default())],
+            "tool_use" => {
+                let state = &part["state"];
+                let mut lines = vec![LogLine::new(
+                    LogKind::Tool,
+                    format!("{} {}", part["tool"].as_str().unwrap_or("tool"), summarize_json(&state["input"])),
+                )];
+                if let Some(o) = state["output"].as_str() {
+                    lines.push(LogLine::new(LogKind::ToolResult, truncate(o, 2000)));
+                }
+                lines
+            }
+            "error" => {
+                let msg = v["error"]["data"]["message"]
+                    .as_str()
+                    .or(v["error"]["message"].as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| v["error"].to_string());
+                self.error = Some(msg.clone());
+                vec![LogLine::new(LogKind::Error, msg)]
+            }
+            "step_start" | "step_finish" => vec![],
+            _ => vec![LogLine::new(LogKind::Info, summarize_json(v))],
+        }
+    }
+}
+
+fn summarize_json(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Object(map) => {
+            // Prefer the most telling field of common tool inputs.
+            for key in ["command", "file_path", "path", "pattern", "url", "query", "description"] {
+                if let Some(s) = map.get(key).and_then(Value::as_str) {
+                    return truncate(s, 300);
+                }
+            }
+            truncate(&v.to_string(), 300)
+        }
+        _ => truncate(&v.to_string(), 300),
+    }
+}
+
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}… [truncated]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::builtin_runtimes;
+    use crate::model::Effort;
+
+    fn persona(model: &str, effort: Effort) -> Persona {
+        Persona {
+            id: "p".into(),
+            name: "P".into(),
+            role: String::new(),
+            runtime: "claude".into(),
+            model: model.into(),
+            effort,
+            prompt: String::new(),
+            extra_args: vec!["--foo".into()],
+            env: Default::default(),
+            position: None,
+        }
+    }
+
+    #[test]
+    fn groups_with_empty_placeholders_are_dropped() {
+        let rts = builtin_runtimes();
+        let p = persona("", Effort::High);
+        let inv = Invocation {
+            spec: &rts["claude"],
+            persona: &p,
+            prompt: "hi",
+            workdir: Path::new("/tmp"),
+            native_session: None,
+            resume: false,
+        };
+        let (args, in_args) = build_args(&inv);
+        assert!(!in_args);
+        assert!(!args.contains(&"--model".to_string()));
+        assert!(!args.contains(&"--session-id".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--effort", "high"]));
+        assert_eq!(args.last().unwrap(), "--foo");
+    }
+
+    #[test]
+    fn resume_args_and_effort_map() {
+        let rts = builtin_runtimes();
+        let p = persona("opus", Effort::Minimal);
+        let inv = Invocation {
+            spec: &rts["claude"],
+            persona: &p,
+            prompt: "hi",
+            workdir: Path::new("/tmp"),
+            native_session: Some("abc"),
+            resume: true,
+        };
+        let (args, _) = build_args(&inv);
+        assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
+        assert!(args.windows(2).any(|w| w == ["--effort", "low"]));
+    }
+
+    #[test]
+    fn prompt_placeholder_goes_in_args() {
+        let rts = builtin_runtimes();
+        let p = persona("deepseek/deepseek-v4-flash", Effort::Medium);
+        let inv = Invocation {
+            spec: &rts["opencode"],
+            persona: &p,
+            prompt: "do it",
+            workdir: Path::new("/tmp"),
+            native_session: None,
+            resume: false,
+        };
+        let (args, in_args) = build_args(&inv);
+        assert!(in_args);
+        assert!(args.contains(&"do it".to_string()));
+        assert!(describe_command("opencode", &args, "do it").contains("<prompt>"));
+    }
+
+    #[test]
+    fn parses_claude_stream_json() {
+        let mut p = OutputParser::new(OutputFormat::ClaudeStreamJson);
+        p.feed(r#"{"type":"system","subtype":"init","session_id":"s1","model":"opus"}"#);
+        let l = p.feed(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#);
+        assert_eq!(l[0].text, "Bash ls");
+        p.feed(r#"{"type":"result","subtype":"success","result":"all done","is_error":false}"#);
+        let out = p.finish();
+        assert_eq!(out.text, "all done");
+        assert_eq!(out.native_session.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn parses_codex_json() {
+        let mut p = OutputParser::new(OutputFormat::CodexJson);
+        p.feed(r#"{"type":"thread.started","thread_id":"t1"}"#);
+        p.feed(r#"{"type":"item.completed","item":{"id":"1","type":"agent_message","text":"first"}}"#);
+        p.feed(r#"{"type":"item.completed","item":{"id":"2","type":"agent_message","text":"final"}}"#);
+        let out = p.finish();
+        assert_eq!(out.text, "final");
+        assert_eq!(out.native_session.as_deref(), Some("t1"));
+    }
+
+    #[tokio::test]
+    async fn runs_a_text_process_via_stdin() {
+        let mut spec = builtin_runtimes()["hermes"].clone();
+        spec.command = "cat".into();
+        spec.args = vec![];
+        let p = persona("", Effort::Medium);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ctx, crx) = watch::channel(false);
+        let out = run_process(
+            Invocation {
+                spec: &spec,
+                persona: &Persona { extra_args: vec![], ..p },
+                prompt: "hello\nworld",
+                workdir: Path::new("."),
+                native_session: None,
+                resume: false,
+            },
+            tx,
+            crx,
+        )
+        .await;
+        assert_eq!(out.text, "hello\nworld");
+        assert!(out.error.is_none());
+        assert_eq!(rx.recv().await.unwrap().kind, LogKind::Command);
+    }
+}

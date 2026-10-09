@@ -1,0 +1,50 @@
+# Copy to chimera.yaml (picked up automatically from the working directory) or pass --config.
+# Every key is optional; runtimes listed here are merged over the built-in definitions.
+
+bind: 127.0.0.1:7878
+data_dir: data
+
+# LLM used by "Generate prompt" in the team editor (also editable under Settings in the UI).
+# `api: openai` works with any OpenAI-compatible endpoint (DeepSeek, OpenAI, OpenRouter, Ollama, vLLM…).
+prompt_llm:
+  api: openai
+  base_url: https://api.deepseek.com
+  model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY   # name of the env var; the key is never written to disk
+  temperature: 0.7
+
+# Runtime definitions. Argument templates support {model} {effort} {prompt} {workdir} {native_session}.
+# A nested list is a group that is dropped when any placeholder in it is empty.
+# Without {prompt} in the args, the prompt is written to stdin.
+runtimes:
+  # Example: point hermes at a specific binary and pass the provider explicitly.
+  hermes:
+    label: Hermes Agent (Nous Research)
+    command: hermes
+    args: [chat, ["--provider", "openrouter"], ["--model", "{model}"], -q, "{prompt}"]
+    output: text
+    models: [anthropic/claude-opus-5-5, nousresearch/hermes-4-405b]
+
+  # Example: opencode without the reasoning-effort variant flag (for older opencode versions).
+  # opencode:
+  #   command: opencode
+  #   args: [run, ["--model", "{model}"], --format, json, "{prompt}"]
+  #   output: opencode-json
+
+  # Example: let codex keep its own conversation across turns instead of replaying history.
+  # codex:
+  #   command: codex
+  #   session: capture            # thread id is read from the `thread.started` event
+  #   output: codex-json
+  #   args: [exec, ["--model", "{model}"], ["-c", "model_reasoning_effort=\"{effort}\""], --json,
+  #          --skip-git-repo-check, --dangerously-bypass-approvals-and-sandbox, "-"]
+  #   resume_args: [exec, ["--model", "{model}"], --json, --skip-git-repo-check,
+  #                 --dangerously-bypass-approvals-and-sandbox, resume, "{native_session}", "-"]
+
+  # Example: any other CLI that prints its answer on stdout.
+  # aider:
+  #   label: Aider
+  #   command: aider
+  #   args: [--yes-always, --no-pretty, ["--model", "{model}"], --message, "{prompt}"]
+  #   output: text
+  #   timeout_secs: 1800
