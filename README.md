@@ -134,7 +134,7 @@ Built-in defaults:
 
 | Runtime | Invocation | Output parsing |
 |---|---|---|
-| `claude` | `claude -p --model M --effort E --output-format stream-json --verbose --permission-mode bypassPermissions` (prompt on stdin) | text, thinking, tool calls/results, cost |
+| `claude` | `claude -p --model M --effort E --output-format stream-json --verbose --permission-mode bypassPermissions --no-chrome` (prompt on stdin) | text, thinking, tool calls/results, cost |
 | `codex` | `codex exec --model M -c model_reasoning_effort="E" --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -` | agent messages, reasoning, commands, file changes |
 | `opencode` | `opencode run --model M --variant E --format json "<prompt>"` | text, reasoning, tool use |
 | `hermes` | `hermes chat --model M -q "<prompt>"` | plain text |
@@ -167,6 +167,9 @@ Agents run **unattended with permission prompts disabled** (`bypassPermissions`,
 `--dangerously-bypass-approvals-and-sandbox`), because nobody is there to approve them. Run Chimera in a
 container or VM, or on a machine and workspace you are comfortable letting agents modify. The server binds to
 `127.0.0.1` by default and has no authentication. Do not expose it publicly.
+
+Claude agents are started with `--no-chrome`, so an unattended agent can never drive your real browser through
+the Claude in Chrome integration, even if it is enabled in your Claude Code settings.
 
 ## Data layout
 

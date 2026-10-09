@@ -223,6 +223,8 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 one("--verbose"),
                 one("--permission-mode"),
                 one("bypassPermissions"),
+                // Unattended agents must never drive the user's real browser.
+                one("--no-chrome"),
             ],
             resume_args: Some(vec![
                 one("-p"),
@@ -234,6 +236,8 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 one("--verbose"),
                 one("--permission-mode"),
                 one("bypassPermissions"),
+                // Unattended agents must never drive the user's real browser.
+                one("--no-chrome"),
             ]),
             session: SessionMode::Preassign,
             output: OutputFormat::ClaudeStreamJson,

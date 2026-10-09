@@ -898,15 +898,18 @@ async function teamEditorPage(teamId) {
       onchange: e => { p.runtime = e.target.value; picker.reset(); changed(); renderEfforts(); },
     }, rts.map(r => h('option', { value: r.name }, `${r.label || r.name}${r.available ? '' : ' (not installed)'}`)));
     rtSel.value = p.runtime;
-    const effortSel = h('select', { onchange: e => { p.effort = e.target.value; changed(); renderEfforts(); } });
+    // The options of this native <select> are built once and never touched again: rewriting a
+    // native select's options while its popup may be open (e.g. when the model list finishes
+    // loading) is a known way to crash Chrome's browser process on macOS.
+    const effortSel = h('select', { onchange: e => { p.effort = e.target.value; changed(); renderEfforts(); } },
+      EFFORTS.map(x => h('option', { value: x }, x)));
+    effortSel.value = p.effort;
     const effortNote = h('div', { class: 'small avail no' });
-    // Mark efforts the chosen model does not support (after the runtime's effort mapping).
+    // Warn when the chosen model does not support the effort (after the runtime's effort mapping).
     const renderEfforts = () => {
       const supported = picker.current()?.efforts;
       const map = rts.find(r => r.name === p.runtime)?.effort_map || {};
       const ok = e => !supported?.length || map[e] === '' || supported.includes(map[e] ?? e);
-      effortSel.replaceChildren(...EFFORTS.map(x => h('option', { value: x }, ok(x) ? x : `${x} (not supported)`)));
-      effortSel.value = p.effort;
       effortNote.textContent = ok(p.effort) ? '' : `${p.model} does not support “${p.effort}” effort (supports: ${supported.join(', ')}).`;
     };
     const picker = modelPicker(p, () => { changed(); renderEfforts(); });
