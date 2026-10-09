@@ -641,7 +641,96 @@ async function teamsPage() {
 
 // ---------------------------------------------------------------- team editor
 
-const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const CUSTOM_MODEL = '__custom__';
+
+/**
+ * Model dropdown fed by the runtime's own model list (asked from its CLI or API by the server).
+ * Keeps free-text entry through a "Custom model id…" option.
+ */
+function modelPicker(p, onChange) {
+  const sel = h('select', {});
+  const custom = h('input', { class: 'hidden', placeholder: 'model id as the CLI expects it', style: 'margin-top:4px' });
+  const info = h('div', { class: 'small muted', style: 'margin-top:4px' });
+  let list = null, loadSeq = 0, autoPick = false;
+  const models = () => list?.models || [];
+  const current = () => models().find(m => m.id === p.model);
+
+  async function load(refresh) {
+    const seq = ++loadSeq, runtime = p.runtime;
+    info.replaceChildren(h('span', { class: 'spinner' }), ' asking the CLI for its models…');
+    let res;
+    try { res = await api('GET', `/api/runtimes/${encodeURIComponent(runtime)}/models${refresh ? '?refresh=true' : ''}`); }
+    catch (e) { res = { models: [], error: e.message }; }
+    if (seq !== loadSeq) return; // a newer runtime was picked meanwhile
+    list = res;
+    if (autoPick && !p.model && models().length) { p.model = models()[0].id; onChange(); }
+    autoPick = false;
+    render();
+  }
+
+  function label(m) {
+    const name = m.name && m.name !== m.id ? `${m.name} — ${m.id}` : m.id;
+    return m.context ? `${name}  (${Math.round(m.context / 1000)}k ctx)` : name;
+  }
+
+  function render() {
+    const opts = [h('option', { value: '' }, 'runtime default')];
+    const known = models().some(m => m.id === p.model);
+    if (p.model && !known) opts.push(h('option', { value: p.model }, `${p.model} (custom)`));
+    const groups = new Map();
+    for (const m of models()) {
+      const g = m.group || '';
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(h('option', { value: m.id }, label(m)));
+    }
+    for (const [g, items] of groups) opts.push(g ? h('optgroup', { label: g }, items) : items);
+    opts.push(h('option', { value: CUSTOM_MODEL }, 'Custom model id…'));
+    sel.replaceChildren(...opts.flat());
+    sel.value = p.model || '';
+    renderInfo();
+  }
+
+  function renderInfo() {
+    const parts = [];
+    if (list?.error) parts.push(h('span', { class: 'avail no', title: list.error }, '⚠ ' + list.error.slice(0, 160) + ' — showing suggestions. '));
+    else if (list?.source === 'cli') parts.push(`${models().length} models from `, h('code', {}, list.via), '. ');
+    else if (list?.source === 'api') parts.push(`${models().length} models (aliases + ${list.via}). `);
+    else if (list?.note) parts.push(list.note + ' ');
+    parts.push(h('a', { href: 'javascript:void 0', onclick: () => load(true) }, '↻ refresh'));
+    const m = current();
+    if (m?.description) parts.push(h('div', {}, m.description));
+    info.replaceChildren(...parts);
+  }
+
+  sel.addEventListener('change', () => {
+    if (sel.value === CUSTOM_MODEL) {
+      custom.classList.remove('hidden');
+      custom.value = p.model;
+      custom.focus();
+      sel.value = p.model || '';
+      return;
+    }
+    custom.classList.add('hidden');
+    p.model = sel.value;
+    renderInfo();
+    onChange();
+  });
+  custom.addEventListener('change', () => {
+    p.model = custom.value.trim();
+    custom.classList.add('hidden');
+    render();
+    onChange();
+  });
+
+  return {
+    el: h('div', {}, sel, custom, info),
+    load,
+    current,
+    /** Called when the runtime changes: forget the old model and fetch the new list. */
+    reset() { p.model = ''; list = null; autoPick = true; render(); load(false); },
+  };
+}
 
 async function teamEditorPage(teamId) {
   const isNew = teamId === 'new';
@@ -773,21 +862,23 @@ async function teamEditorPage(teamId) {
   function personaForm(p) {
     const changed = (rerenderGraph = true) => { setDirty(true); if (rerenderGraph) graph.render(); };
     const rtSel = h('select', {
-      onchange: e => {
-        p.runtime = e.target.value;
-        const rt = rts.find(r => r.name === p.runtime);
-        if (rt && rt.models.length && !rt.models.includes(p.model)) { p.model = rt.models[0]; modelIn.value = p.model; }
-        refreshModels(); changed();
-      },
+      onchange: e => { p.runtime = e.target.value; picker.reset(); changed(); renderEfforts(); },
     }, rts.map(r => h('option', { value: r.name }, `${r.label || r.name}${r.available ? '' : ' (not installed)'}`)));
     rtSel.value = p.runtime;
-    const listId = 'models-' + Math.random().toString(36).slice(2);
-    const modelList = h('datalist', { id: listId });
-    const refreshModels = () => modelList.replaceChildren(...(rts.find(r => r.name === p.runtime)?.models || []).map(m => h('option', { value: m })));
-    refreshModels();
-    const modelIn = h('input', { value: p.model, list: listId, placeholder: 'runtime default', oninput: e => { p.model = e.target.value; changed(); } });
-    const effortSel = h('select', { onchange: e => { p.effort = e.target.value; changed(); } }, EFFORTS.map(x => h('option', { value: x }, x)));
-    effortSel.value = p.effort;
+    const effortSel = h('select', { onchange: e => { p.effort = e.target.value; changed(); renderEfforts(); } });
+    const effortNote = h('div', { class: 'small avail no' });
+    // Mark efforts the chosen model does not support (after the runtime's effort mapping).
+    const renderEfforts = () => {
+      const supported = picker.current()?.efforts;
+      const map = rts.find(r => r.name === p.runtime)?.effort_map || {};
+      const ok = e => !supported?.length || map[e] === '' || supported.includes(map[e] ?? e);
+      effortSel.replaceChildren(...EFFORTS.map(x => h('option', { value: x }, ok(x) ? x : `${x} (not supported)`)));
+      effortSel.value = p.effort;
+      effortNote.textContent = ok(p.effort) ? '' : `${p.model} does not support “${p.effort}” effort (supports: ${supported.join(', ')}).`;
+    };
+    const picker = modelPicker(p, () => { changed(); renderEfforts(); });
+    picker.load(false).then(renderEfforts);
+    renderEfforts();
     const idIn = h('input', { value: p.id });
     idIn.addEventListener('change', () => {
       const nid = slug(idIn.value);
@@ -838,10 +929,11 @@ async function teamEditorPage(teamId) {
         h('div', {}, h('label', {}, 'Name'), h('input', { value: p.name, oninput: e => { p.name = e.target.value; changed(); refreshEntry(); } })),
         h('div', {}, h('label', {}, 'Id (used in messages)'), idIn)),
       h('label', {}, 'Role'), h('input', { value: p.role, placeholder: 'e.g. Senior Backend Engineer', oninput: e => { p.role = e.target.value; changed(false); } }),
-      h('div', { class: 'grid', style: 'grid-template-columns:1fr 1fr 110px;gap:0 10px' },
+      h('div', { class: 'grid', style: 'grid-template-columns:1fr 150px;gap:0 10px' },
         h('div', {}, h('label', {}, 'Runtime'), rtSel),
-        h('div', {}, h('label', {}, 'Model'), modelIn, modelList),
         h('div', {}, h('label', {}, 'Effort'), effortSel)),
+      effortNote,
+      h('label', {}, 'Model'), picker.el,
       rt && !rt.available ? h('div', { class: 'avail no' }, `“${rt.command}” was not found on PATH of the server.`) : null,
       h('div', { class: 'gen-box' },
         h('div', { class: 'small muted' }, 'Describe the persona and let the configured LLM write its prompt (see Settings).'),
@@ -1023,12 +1115,12 @@ async function settingsPage() {
         h('h2', {}, 'Agent runtimes'),
         h('p', { class: 'muted small' }, 'Configured in chimera.yaml (command templates, output parsers, model suggestions).'),
         h('table', {},
-          h('thead', {}, h('tr', {}, ['Runtime', 'Command', 'Status', 'Models'].map(c => h('th', {}, c)))),
+          h('thead', {}, h('tr', {}, ['Runtime', 'Command', 'Status', 'Model list from'].map(c => h('th', {}, c)))),
           h('tbody', {}, rts.map(r => h('tr', {},
             h('td', {}, h('span', { class: 'dot', style: `display:inline-block;margin-right:6px;background:${runtimeColor(r.name)}` }), h('b', {}, r.name), h('div', { class: 'muted small' }, r.label)),
             h('td', { class: 'mono' }, r.command || '—'),
             h('td', {}, r.available ? h('span', { class: 'badge completed' }, 'available') : h('span', { class: 'badge idle' }, 'not on PATH')),
-            h('td', { class: 'small muted' }, r.models.join(', '))))))))));
+            h('td', { class: 'small muted mono' }, r.models_via)))))))));
 }
 
 route();

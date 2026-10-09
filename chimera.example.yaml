@@ -41,6 +41,9 @@ runtimes:
     command: hermes
     args: [chat, ["--provider", "openrouter"], ["--model", "{model}"], -q, "{prompt}"]
     output: text
+    # Model list for the persona editor. Hermes only has an interactive picker, so the default is
+    # the static `models` list; any command that prints one model id per line works instead:
+    # models_source: { kind: command, args: [...], format: lines }
     models: [anthropic/claude-opus-5-5, nousresearch/hermes-4-405b]
 
   # Example: opencode without the reasoning-effort variant flag (for older opencode versions).

@@ -17,7 +17,7 @@ use serde_json::json;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::config::{PromptLlmConfig, RuntimeSpec};
+use crate::config::{ModelsSource, PromptLlmConfig, RuntimeSpec};
 use crate::decisions::DecisionsConfig;
 use crate::model::Team;
 use crate::orchestrator::{NewSession, Orchestrator};
@@ -30,6 +30,7 @@ pub struct AppState {
     pub settings: SettingsStore,
     pub prompt_llm: RwLock<PromptLlmConfig>,
     pub orchestrator: Arc<Orchestrator>,
+    pub catalog: crate::catalog::Catalog,
     pub sessions: RwLock<BTreeMap<String, Arc<Session>>>,
 }
 
@@ -64,6 +65,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/app.js", get(app_js))
         .route("/app.css", get(app_css))
         .route("/api/runtimes", get(list_runtimes))
+        .route("/api/runtimes/{name}/models", get(runtime_models))
         .route("/api/teams", get(list_teams).post(create_team))
         .route("/api/teams/{id}", get(get_team).put(update_team).delete(delete_team))
         .route("/api/personas/generate", post(generate_persona))
@@ -97,6 +99,10 @@ struct RuntimeInfo {
     command: String,
     available: bool,
     models: Vec<String>,
+    /// How chimera efforts translate to this CLI's values ("" = flag omitted).
+    effort_map: BTreeMap<String, String>,
+    /// Where the model list comes from, for display.
+    models_via: String,
 }
 
 async fn list_runtimes(State(st): State<Arc<AppState>>) -> Json<Vec<RuntimeInfo>> {
@@ -110,9 +116,31 @@ async fn list_runtimes(State(st): State<Arc<AppState>>) -> Json<Vec<RuntimeInfo>
             command: spec.command.clone(),
             available: spec.kind == crate::config::RuntimeKind::Mock || command_exists(&spec.command),
             models: spec.models.clone(),
+            effort_map: spec.effort_map.clone(),
+            models_via: match &spec.models_source {
+                ModelsSource::Static => "chimera.yaml".into(),
+                ModelsSource::Command { args, .. } => format!("{} {}", spec.command, args.join(" ")),
+                ModelsSource::AnthropicApi { api_key_env } => format!("aliases + Anthropic API (${api_key_env})"),
+            },
         })
         .collect();
     Json(infos)
+}
+
+#[derive(Deserialize)]
+struct ModelsQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// Models the runtime can use, asked from its CLI (or API) and cached for a few minutes.
+async fn runtime_models(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<ModelsQuery>,
+) -> AppResult<Json<crate::catalog::ModelList>> {
+    let spec = st.orchestrator.runtimes.get(&name).ok_or_else(|| ApiError::not_found("runtime"))?;
+    Ok(Json(st.catalog.list(&name, spec, q.refresh).await))
 }
 
 fn command_exists(cmd: &str) -> bool {

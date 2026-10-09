@@ -1,3 +1,4 @@
+mod catalog;
 mod config;
 mod decisions;
 mod model;
@@ -92,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         prompt_llm: RwLock::new(prompt_llm),
         orchestrator,
         sessions: RwLock::new(sessions),
+        catalog: catalog::Catalog::default(),
     });
 
     let app = web::router(state);

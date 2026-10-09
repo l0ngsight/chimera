@@ -73,6 +73,8 @@ pub enum Effort {
     High,
     Xhigh,
     Max,
+    /// Above `max`; offered by some Codex models.
+    Ultra,
 }
 
 impl Effort {
@@ -84,6 +86,7 @@ impl Effort {
             Effort::High => "high",
             Effort::Xhigh => "xhigh",
             Effort::Max => "max",
+            Effort::Ultra => "ultra",
         }
     }
 }

@@ -121,6 +121,8 @@ runtimes:
     output: claude-stream-json  # text | claude-stream-json | codex-json | opencode-json
     effort_map: { minimal: low } # translate effort levels per CLI ("" drops the flag)
     timeout_secs: 3600
+    models_source: { kind: anthropic-api }   # where the persona editor gets the model list
+    models: [opus, sonnet, haiku, fable]      # suggestions, and the fallback list
 ```
 
 - Placeholders: `{model}`, `{effort}`, `{prompt}`, `{workdir}`, `{native_session}`. A nested list is an
@@ -137,6 +139,23 @@ Built-in defaults:
 | `opencode` | `opencode run --model M --variant E --format json "<prompt>"` | text, reasoning, tool use |
 | `hermes` | `hermes chat --model M -q "<prompt>"` | plain text |
 | `mock` | built in | simulated delegation |
+
+### Model lists
+
+The persona editor's **Model** dropdown asks the selected CLI which models it can run. The list is cached for
+10 minutes; **↻ refresh** fetches it again. Where the CLI reports supported reasoning efforts, the **Effort**
+dropdown marks the ones the chosen model can't use.
+
+| Runtime | Model list from (`models_source`) |
+|---|---|
+| `codex` | `codex debug models` (`kind: command, format: codex-catalog`): names, descriptions, context window and supported efforts |
+| `opencode` | `opencode models --verbose` (`format: opencode-verbose`): every model of your configured providers, grouped by provider, with reasoning variants |
+| `claude` | Claude Code has no list command: its aliases (`opus`, `sonnet`, …), plus every model id from the Anthropic Models API when `ANTHROPIC_API_KEY` is set on the server (`kind: anthropic-api`) |
+| `hermes` | Only has an interactive picker, so the static `models` list (`kind: static`) |
+
+Any runtime can use `kind: command` with `format: lines` (one model id per line) to plug in its own listing
+command. When fetching fails, the dropdown falls back to the static `models` and shows why. **Custom model id…**
+always allows free text.
 
 > The Claude invocation is verified end to end. The codex, opencode and hermes templates follow those CLIs'
 > documented non-interactive modes, but flags change between versions. If one fails, the exact command line and
@@ -168,6 +187,7 @@ be resumed by sending it a message.
 | Method & path | Purpose |
 |---|---|
 | `GET /api/runtimes` | runtimes, availability, model suggestions |
+| `GET /api/runtimes/{name}/models?refresh=` | models the runtime's CLI (or API) reports, cached for 10 minutes |
 | `GET/POST /api/teams`, `GET/PUT/DELETE /api/teams/{id}` | team CRUD |
 | `POST /api/personas/generate` | generate a persona prompt with the configured LLM |
 | `GET/PUT /api/settings` | prompt-LLM and Jev settings (`{prompt_llm?, decisions?}`) |
@@ -188,5 +208,5 @@ cargo clippy --all-targets
 
 Source map: `model.rs` (teams/graph), `config.rs` (runtimes and LLM settings), `runtime.rs` (process
 launching and output parsers), `orchestrator.rs` (scheduler, prompt building, message protocol, mock runtime),
-`session.rs` (state, events, persistence), `decisions.rs` (Jev client and decision questions), `promptgen.rs` (persona prompt generation), `web.rs` (API and SSE),
+`session.rs` (state, events, persistence), `decisions.rs` (Jev client and decision questions), `catalog.rs` (model lists from CLIs), `promptgen.rs` (persona prompt generation), `web.rs` (API and SSE),
 `web/` (UI, embedded into the binary).

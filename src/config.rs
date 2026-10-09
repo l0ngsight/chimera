@@ -106,7 +106,10 @@ pub struct RuntimeSpec {
     /// Kill the process after this many seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Model suggestions for the UI.
+    /// Where the persona editor gets this runtime's model list from.
+    #[serde(default)]
+    pub models_source: ModelsSource,
+    /// Model suggestions for the UI (also the fallback when `models_source` fails).
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -156,6 +159,43 @@ pub enum OutputFormat {
     OpencodeJson,
 }
 
+/// How to discover the models a runtime can use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModelsSource {
+    /// Only the `models` suggestions.
+    #[default]
+    Static,
+    /// Run `command` with these arguments and parse its stdout.
+    Command {
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        format: ModelsFormat,
+    },
+    /// Anthropic Models API (Claude Code itself cannot list models).
+    AnthropicApi {
+        #[serde(default = "default_anthropic_key_env")]
+        api_key_env: String,
+    },
+}
+
+fn default_anthropic_key_env() -> String {
+    "ANTHROPIC_API_KEY".into()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelsFormat {
+    /// One model id per line.
+    #[default]
+    Lines,
+    /// `codex debug models` JSON.
+    CodexCatalog,
+    /// `opencode models --verbose`.
+    OpencodeVerbose,
+}
+
 fn one(s: &str) -> ArgItem {
     ArgItem::One(s.into())
 }
@@ -197,9 +237,10 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             ]),
             session: SessionMode::Preassign,
             output: OutputFormat::ClaudeStreamJson,
-            effort_map: BTreeMap::from([("minimal".into(), "low".into())]),
+            effort_map: BTreeMap::from([("minimal".into(), "low".into()), ("ultra".into(), "max".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            models_source: ModelsSource::AnthropicApi { api_key_env: default_anthropic_key_env() },
             models: vec!["opus".into(), "sonnet".into(), "haiku".into(), "fable".into()],
         },
     );
@@ -221,10 +262,14 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             resume_args: None,
             session: SessionMode::None,
             output: OutputFormat::CodexJson,
-            effort_map: BTreeMap::from([("max".into(), "xhigh".into())]),
+            effort_map: BTreeMap::from([("minimal".into(), "low".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
-            models: vec!["gpt-5.6-sol".into(), "gpt-5.5".into(), "gpt-5.5-codex".into()],
+            models_source: ModelsSource::Command {
+                args: vec!["debug".into(), "models".into()],
+                format: ModelsFormat::CodexCatalog,
+            },
+            models: vec!["gpt-5.6-sol".into(), "gpt-5.5".into()],
         },
     );
     m.insert(
@@ -247,6 +292,10 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            models_source: ModelsSource::Command {
+                args: vec!["models".into(), "--verbose".into()],
+                format: ModelsFormat::OpencodeVerbose,
+            },
             models: vec![
                 "deepseek/deepseek-v4-flash".into(),
                 "deepseek/deepseek-v4-pro".into(),
@@ -267,6 +316,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            models_source: ModelsSource::Static,
             models: vec!["anthropic/claude-opus-5-5".into(), "nousresearch/hermes-4-405b".into()],
         },
     );
@@ -283,6 +333,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: 60,
+            models_source: ModelsSource::Static,
             models: vec!["mock".into()],
         },
     );
