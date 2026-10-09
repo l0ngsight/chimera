@@ -206,6 +206,7 @@ struct SettingsView {
     /// Name of the environment variable the Jev key is read from (never the key itself).
     decisions_key_env: Option<String>,
     decisions_active: bool,
+    guard: crate::guard::GuardStatus,
 }
 
 async fn get_settings(State(st): State<Arc<AppState>>) -> Json<SettingsView> {
@@ -217,6 +218,7 @@ async fn get_settings(State(st): State<Arc<AppState>>) -> Json<SettingsView> {
         api_key_present,
         decisions_key_env: decisions.api_key().map(|(_, var)| var),
         decisions_active: decisions.active(),
+        guard: st.orchestrator.guard.status(),
         decisions,
     })
 }
@@ -227,6 +229,8 @@ struct SettingsUpdate {
     prompt_llm: Option<PromptLlmConfig>,
     #[serde(default)]
     decisions: Option<DecisionsConfig>,
+    #[serde(default)]
+    guard_enabled: Option<bool>,
 }
 
 async fn put_settings(
@@ -246,10 +250,12 @@ async fn put_settings(
     let settings = Settings {
         prompt_llm: update.prompt_llm.unwrap_or_else(|| st.prompt_llm.read().unwrap().clone()),
         decisions: Some(update.decisions.unwrap_or_else(|| st.orchestrator.decisions.read().unwrap().clone())),
+        guard_enabled: Some(update.guard_enabled.unwrap_or_else(|| st.orchestrator.guard.status().enabled)),
     };
     st.settings.save(&settings)?;
     *st.prompt_llm.write().unwrap() = settings.prompt_llm;
     *st.orchestrator.decisions.write().unwrap() = settings.decisions.unwrap_or_default();
+    st.orchestrator.guard.set_enabled(settings.guard_enabled.unwrap_or(true));
     Ok(get_settings(State(st)).await)
 }
 

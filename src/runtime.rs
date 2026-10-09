@@ -46,6 +46,8 @@ pub struct Invocation<'a> {
     /// Native session to resume (`Some`) or to create (preassigned id for a fresh session).
     pub native_session: Option<&'a str>,
     pub resume: bool,
+    /// Process-guard wrapper (program + leading args) when the guard is active.
+    pub wrapper: Option<(String, Vec<String>)>,
 }
 
 /// Expands the argument templates for an invocation.
@@ -131,9 +133,18 @@ pub async fn run_process(
 ) -> TurnOutput {
     let spec = inv.spec;
     let (args, prompt_in_args) = build_args(&inv);
-    let _ = log.send(LogLine::new(LogKind::Command, describe_command(&spec.command, &args, inv.prompt)));
+    let mut shown = describe_command(&spec.command, &args, inv.prompt);
+    // Under the process guard the CLI runs inside an OS sandbox: `<wrapper> <command> <args…>`.
+    let (program, args) = match inv.wrapper.as_ref().filter(|_| spec.guard) {
+        Some((program, prefix)) => {
+            shown = format!("[process guard] {shown}");
+            (program.clone(), prefix.iter().cloned().chain([spec.command.clone()]).chain(args).collect())
+        }
+        None => (spec.command.clone(), args),
+    };
+    let _ = log.send(LogLine::new(LogKind::Command, shown));
 
-    let mut cmd = Command::new(&spec.command);
+    let mut cmd = Command::new(&program);
     cmd.args(&args)
         .current_dir(inv.workdir)
         .stdin(if prompt_in_args { Stdio::null() } else { Stdio::piped() })
@@ -500,6 +511,7 @@ mod tests {
                 workdir: Path::new("/tmp"),
                 native_session: Some("s"),
                 resume,
+                wrapper: None,
             };
             let (args, _) = build_args(&inv);
             assert!(args.contains(&"--no-chrome".to_string()), "resume={resume}");
@@ -513,6 +525,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: None,
             resume: false,
+            wrapper: None,
         };
         let (args, _) = build_args(&inv);
         assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
@@ -530,6 +543,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: None,
             resume: false,
+            wrapper: None,
         };
         let (args, in_args) = build_args(&inv);
         assert!(!in_args);
@@ -550,6 +564,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: Some("abc"),
             resume: true,
+            wrapper: None,
         };
         let (args, _) = build_args(&inv);
         assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
@@ -567,6 +582,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: None,
             resume: false,
+            wrapper: None,
         };
         let (args, in_args) = build_args(&inv);
         assert!(in_args);
@@ -613,6 +629,7 @@ mod tests {
                 workdir: Path::new("."),
                 native_session: None,
                 resume: false,
+                wrapper: None,
             },
             tx,
             crx,
@@ -621,5 +638,36 @@ mod tests {
         assert_eq!(out.text, "hello\nworld");
         assert!(out.error.is_none());
         assert_eq!(rx.recv().await.unwrap().kind, LogKind::Command);
+    }
+
+    #[tokio::test]
+    async fn guarded_runtimes_run_inside_the_wrapper() {
+        // `env CMD ARGS…` behaves like a pass-through sandbox, so the wrapping is observable on any OS.
+        let mut spec = builtin_runtimes()["hermes"].clone();
+        spec.command = "cat".into();
+        spec.args = vec![];
+        let p = Persona { extra_args: vec![], ..persona("", Effort::Medium) };
+        for (guard, expect_prefix) in [(true, true), (false, false)] {
+            spec.guard = guard;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (_ctx, crx) = watch::channel(false);
+            let out = run_process(
+                Invocation {
+                    spec: &spec,
+                    persona: &p,
+                    prompt: "guarded",
+                    workdir: Path::new("."),
+                    native_session: None,
+                    resume: false,
+                    wrapper: Some(("env".into(), vec![])),
+                },
+                tx,
+                crx,
+            )
+            .await;
+            assert_eq!(out.text, "guarded");
+            let cmd = rx.recv().await.unwrap().text;
+            assert_eq!(cmd.starts_with("[process guard]"), expect_prefix, "{cmd}");
+        }
     }
 }

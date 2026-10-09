@@ -31,6 +31,8 @@ pub struct Orchestrator {
     /// Quick decisions with Jev (editable at runtime from the settings page).
     pub decisions: RwLock<DecisionsConfig>,
     pub jev: Jev,
+    /// OS sandbox that keeps agents from killing or quitting the user's programs.
+    pub guard: crate::guard::Guard,
 }
 
 /// A message produced by a turn, after recipient resolution and ack filtering.
@@ -395,6 +397,7 @@ impl Orchestrator {
                             workdir: &workdir,
                             native_session: native_session.as_deref(),
                             resume,
+                            wrapper: orch.guard.wrapper(),
                         },
                         log_tx,
                         cancel,
@@ -1006,6 +1009,7 @@ mod e2e_tests {
             workspaces_dir: d.join("ws"),
             decisions: RwLock::new(decisions),
             jev: Jev::new(),
+            guard: crate::guard::Guard::new(false),
         })
     }
 

@@ -106,12 +106,20 @@ pub struct RuntimeSpec {
     /// Kill the process after this many seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Run under the process guard (OS sandbox that blocks killing/quitting outside programs).
+    /// Off for CLIs that apply their own macOS sandbox, which cannot be nested.
+    #[serde(default = "default_true")]
+    pub guard: bool,
     /// Where the persona editor gets this runtime's model list from.
     #[serde(default)]
     pub models_source: ModelsSource,
     /// Model suggestions for the UI (also the fallback when `models_source` fails).
     #[serde(default)]
     pub models: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_timeout() -> u64 {
@@ -256,6 +264,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::from([("minimal".into(), "low".into()), ("ultra".into(), "max".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            guard: true,
             models_source: ModelsSource::AnthropicApi { api_key_env: default_anthropic_key_env() },
             models: vec!["opus".into(), "sonnet".into(), "haiku".into(), "fable".into()],
         },
@@ -287,6 +296,8 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::from([("minimal".into(), "low".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            // Codex sandboxes its own commands (seatbelt on macOS); sandboxes cannot be nested.
+            guard: false,
             models_source: ModelsSource::Command {
                 args: vec!["debug".into(), "models".into()],
                 format: ModelsFormat::CodexCatalog,
@@ -314,6 +325,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            guard: true,
             models_source: ModelsSource::Command {
                 args: vec!["models".into(), "--verbose".into()],
                 format: ModelsFormat::OpencodeVerbose,
@@ -338,6 +350,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            guard: true,
             models_source: ModelsSource::Static,
             models: vec!["anthropic/claude-opus-5-5".into(), "nousresearch/hermes-4-405b".into()],
         },
@@ -355,6 +368,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: 60,
+            guard: false,
             models_source: ModelsSource::Static,
             models: vec!["mock".into()],
         },

@@ -1,6 +1,7 @@
 mod catalog;
 mod config;
 mod decisions;
+mod guard;
 mod model;
 mod orchestrator;
 mod promptgen;
@@ -65,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let settings = SettingsStore::new(data_dir.join("settings.yaml"));
     let saved = settings.load();
     let prompt_llm = saved.as_ref().map(|s| s.prompt_llm.clone()).unwrap_or_else(|| cfg.prompt_llm.clone());
+    let guard_enabled = saved.as_ref().and_then(|s| s.guard_enabled).unwrap_or(true);
     let decisions_cfg = saved.and_then(|s| s.decisions).unwrap_or_else(|| cfg.decisions.clone());
 
     let sessions_dir = data_dir.join("sessions");
@@ -86,7 +88,15 @@ async fn main() -> anyhow::Result<()> {
         workspaces_dir: data_dir.join("workspaces"),
         decisions: RwLock::new(decisions_cfg),
         jev: decisions::Jev::new(),
+        guard: guard::Guard::new(guard_enabled),
     });
+    orchestrator.guard.self_test().await;
+    let gs = orchestrator.guard.status();
+    if gs.available && gs.enabled {
+        tracing::info!("process guard on: {}", gs.detail);
+    } else {
+        tracing::warn!("process guard OFF ({}): agents could kill or quit your other programs", gs.detail);
+    }
     let state = Arc::new(AppState {
         teams,
         settings,

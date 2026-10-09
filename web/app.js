@@ -338,7 +338,17 @@ function runtimeColor(rt) {
 // ---------------------------------------------------------------- sessions list
 
 async function sessionsPage() {
-  const [teams, sessions] = await Promise.all([api('GET', '/api/teams'), api('GET', '/api/sessions')]);
+  const [teams, sessions, settings] = await Promise.all([
+    api('GET', '/api/teams'), api('GET', '/api/sessions'), api('GET', '/api/settings').catch(() => null),
+  ]);
+  const guard = settings?.guard;
+  const guardWarning = guard && !(guard.available && guard.enabled)
+    ? h('div', { class: 'guard-warning' },
+      h('b', {}, '⚠ Process guard is off. '),
+      guard.enabled ? guard.detail : 'It was turned off in Settings.',
+      ' Agents run shell commands without asking and could quit your browser or other apps. ',
+      h('a', { href: '#/settings' }, 'Settings'))
+    : null;
   const preselect = new URLSearchParams(location.hash.split('?')[1] || '').get('team');
 
   const teamSel = h('select', {}, teams.map(t => h('option', { value: t.id }, t.name)));
@@ -386,7 +396,8 @@ async function sessionsPage() {
         h('label', {}, 'Working directory'), workdir,
         h('div', { class: 'row', style: 'margin-top:12px' },
           h('label', { class: 'inline', title: 'Every persona uses the built-in mock runtime: no CLI or LLM calls. Good for checking the graph.' }, dry, 'Dry run (mock agents)'),
-          h('span', { class: 'spacer' }), startBtn)),
+          h('span', { class: 'spacer' }), startBtn),
+        guardWarning),
       h('div', { class: 'card' },
         h('h2', {}, 'Sessions'),
         h('table', {}, h('thead', {}, h('tr', {}, ['Session', 'Team', 'Status', 'Agents', 'Turns', 'Started'].map(c => h('th', {}, c)))), listBody)))));
@@ -1039,6 +1050,32 @@ const JEV_PROVIDERS = {
   'TypeSafe direct': { base_url: 'https://api.typesafe.ai/v1', api_key_env: 'TYPESAFE_API_KEY' },
 };
 
+/** The OS sandbox that stops agents from killing or quitting the user's programs. */
+function guardCard(settings) {
+  const g = settings.guard;
+  const box = h('input', { type: 'checkbox', checked: g.enabled });
+  const state = h('div', { class: 'small' });
+  const show = s => {
+    const on = s.available && s.enabled;
+    state.className = 'small ' + (on ? 'muted' : 'avail no');
+    state.textContent = (on ? '✔ Protecting your programs — ' : !s.available ? '✖ Not available — ' : '✖ Turned off — ') + s.detail;
+  };
+  show(g);
+  box.addEventListener('change', async () => {
+    if (!box.checked && !confirm('Turn off the process guard? Agents will be able to kill or quit any of your programs, including your browser.')) {
+      box.checked = true;
+      return;
+    }
+    try { show((await api('PUT', '/api/settings', { guard_enabled: box.checked })).guard); toast('Process guard ' + (box.checked ? 'on' : 'off')); }
+    catch (e) { toast(e.message, true); box.checked = !box.checked; }
+  });
+  return h('div', { class: 'card', style: 'grid-column: 1 / -1' },
+    h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, '🛡 Process guard'), h('label', { class: 'inline' }, box, 'Enabled')),
+    h('p', { class: 'muted small' },
+      'Agents run shell commands without asking. The guard runs every agent CLI inside a macOS sandbox (sandbox-exec) that blocks sending signals to, or scripting, any program outside the sandbox — so an agent cannot kill or quit your browser, editors or this server, but can still stop the processes it started. Codex uses its own sandbox instead. Checked on this machine at startup.'),
+    state);
+}
+
 /** Settings for quick orchestration decisions with Jev. */
 function jevCard(settings) {
   const d = settings.decisions;
@@ -1146,6 +1183,7 @@ async function settingsPage() {
         h('label', {}, 'API key environment variable'), f.api_key_env, keyStatus,
         h('label', {}, 'Temperature'), f.temperature,
         h('div', { class: 'row', style: 'margin-top:14px' }, h('span', { class: 'spacer' }), h('button', { class: 'primary', onclick: save }, 'Save'))),
+      guardCard(settings),
       jevCard(settings),
       h('div', { class: 'card', style: 'grid-column: 1 / -1' },
         h('h2', {}, 'Agent runtimes'),

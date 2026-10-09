@@ -95,6 +95,9 @@ pub struct Settings {
     /// `None` when written by a version without Jev support.
     #[serde(default)]
     pub decisions: Option<DecisionsConfig>,
+    /// Process guard switch; `None` means the default (on).
+    #[serde(default)]
+    pub guard_enabled: Option<bool>,
 }
 
 /// Accepts the current format and the original one (a bare `PromptLlmConfig`).
@@ -114,7 +117,9 @@ impl SettingsStore {
         let text = std::fs::read_to_string(&self.path).ok()?;
         match serde_yaml::from_str(&text) {
             Ok(StoredSettings::Current(s)) => Some(s),
-            Ok(StoredSettings::Legacy(prompt_llm)) => Some(Settings { prompt_llm, decisions: None }),
+            Ok(StoredSettings::Legacy(prompt_llm)) => {
+                Some(Settings { prompt_llm, decisions: None, guard_enabled: None })
+            }
             Err(e) => {
                 tracing::warn!("ignoring unreadable {}: {e}", self.path.display());
                 None
@@ -140,7 +145,13 @@ mod tests {
         let s = store.load().unwrap();
         assert_eq!(s.prompt_llm.model, "m");
         assert!(s.decisions.is_none());
-        store.save(&super::Settings { prompt_llm: s.prompt_llm, decisions: Some(Default::default()) }).unwrap();
+        store
+            .save(&super::Settings {
+                prompt_llm: s.prompt_llm,
+                decisions: Some(Default::default()),
+                guard_enabled: None,
+            })
+            .unwrap();
         assert_eq!(store.load().unwrap().decisions.unwrap().model, "jev-latest");
     }
 

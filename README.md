@@ -168,13 +168,16 @@ you may be using at the same time. Chimera layers these guardrails:
 
 | Guardrail | Applies to | Enforced by |
 |---|---|---|
+| **Process guard**: the agent cannot send signals to, or AppleScript, any program outside its sandbox, so it cannot kill or quit your browser, editors or the Chimera server; it can still stop processes it started | Claude, opencode, Hermes (macOS) | `sandbox-exec`, verified by a self-test at startup; status and switch in **Settings → Process guard** |
 | Never kill, quit or restart programs it didn't start (browser, editors, the Chimera server); no killing by name or port; browser testing only in a headless browser with its own profile | every runtime | ground rules in every prompt |
 | `pkill`, `killall`, `kill`, `… \| xargs kill`, `osascript`, `shutdown`, `reboot` are denied (also inside pipes and `&&` chains) | Claude | `--disallowedTools` (holds even with `bypassPermissions`) |
 | No access to your real Chrome through Claude in Chrome | Claude | `--no-chrome` |
-| Shell commands run in Codex's sandbox: writes confined to the workspace, network allowed | Codex | `--sandbox workspace-write` |
+| Shell commands run in Codex's sandbox: writes confined to the workspace, network allowed, signals only within the sandbox | Codex | `--sandbox workspace-write` (macOS sandboxes can't be nested, so Codex uses its own instead of the process guard) |
 
-Prompt rules guide well-behaved agents, but a determined agent can get around them, and opencode and Hermes rely
-on them alone. For full isolation, run Chimera (and the CLIs) in a container, VM or separate OS user. The server
+The process guard is on by default and needs no configuration. If its self-test fails (or on Linux, where it is
+not available), the new-session form shows a warning. It protects your running programs, not your files: agents
+can still read and write anything your user can. For full isolation, run Chimera (and the CLIs) in a container,
+VM or separate OS user. The server
 binds to `127.0.0.1` by default and has no authentication. Do not expose it publicly.
 
 ## Data layout
