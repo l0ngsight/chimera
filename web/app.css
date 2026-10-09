@@ -226,3 +226,17 @@ tr.clickable:hover td { background: var(--panel-2); }
 .decision { font-size: 12px; color: var(--muted); margin: 4px 0; padding: 3px 8px; border-left: 2px solid #6b5a1e; }
 .decision.applied { border-left-color: #fbbf24; color: var(--text); }
 .decision.failed { border-left-color: var(--error); }
+
+/* ---------- model combobox (in-page list; native <select> popups choke on thousands of options) ---------- */
+.combo { position: relative; }
+.combo-menu {
+  position: absolute; z-index: 20; left: 0; right: 0; top: 38px;
+  max-height: 320px; overflow-y: auto;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
+.combo-group { padding: 6px 10px 2px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.combo-item { padding: 5px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.combo-item:hover, .combo-item.active { background: #24305a; }
+.combo-item.selected { color: var(--accent); }
+.combo-note { padding: 6px 10px; font-size: 12px; color: var(--muted); }

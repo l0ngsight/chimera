@@ -642,17 +642,21 @@ async function teamsPage() {
 // ---------------------------------------------------------------- team editor
 
 const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-const CUSTOM_MODEL = '__custom__';
+const MAX_MODEL_ROWS = 100;
 
 /**
- * Model dropdown fed by the runtime's own model list (asked from its CLI or API by the server).
- * Keeps free-text entry through a "Custom model id…" option.
+ * Model combobox fed by the runtime's own model list (asked from its CLI or API by the server).
+ *
+ * Deliberately not a native <select>: CLIs such as opencode can list thousands of models, and a
+ * native popup that long is drawn by the browser process itself (shared by every window) and can
+ * hang or crash it. This list lives in the page, filters as you type and renders at most
+ * MAX_MODEL_ROWS rows. Any typed text is accepted as a custom model id.
  */
 function modelPicker(p, onChange) {
-  const sel = h('select', {});
-  const custom = h('input', { class: 'hidden', placeholder: 'model id as the CLI expects it', style: 'margin-top:4px' });
+  const input = h('input', { value: p.model, placeholder: 'runtime default — type to search', autocomplete: 'off', spellcheck: 'false' });
+  const menu = h('div', { class: 'combo-menu hidden', role: 'listbox' });
   const info = h('div', { class: 'small muted', style: 'margin-top:4px' });
-  let list = null, loadSeq = 0, autoPick = false;
+  let list = null, loadSeq = 0, autoPick = false, rows = [], active = -1;
   const models = () => list?.models || [];
   const current = () => models().find(m => m.id === p.model);
 
@@ -664,31 +668,58 @@ function modelPicker(p, onChange) {
     catch (e) { res = { models: [], error: e.message }; }
     if (seq !== loadSeq) return; // a newer runtime was picked meanwhile
     list = res;
-    if (autoPick && !p.model && models().length) { p.model = models()[0].id; onChange(); }
+    if (autoPick && !p.model && models().length) { p.model = models()[0].id; input.value = p.model; onChange(); }
     autoPick = false;
-    render();
-  }
-
-  function label(m) {
-    const name = m.name && m.name !== m.id ? `${m.name} — ${m.id}` : m.id;
-    return m.context ? `${name}  (${Math.round(m.context / 1000)}k ctx)` : name;
-  }
-
-  function render() {
-    const opts = [h('option', { value: '' }, 'runtime default')];
-    const known = models().some(m => m.id === p.model);
-    if (p.model && !known) opts.push(h('option', { value: p.model }, `${p.model} (custom)`));
-    const groups = new Map();
-    for (const m of models()) {
-      const g = m.group || '';
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(h('option', { value: m.id }, label(m)));
-    }
-    for (const [g, items] of groups) opts.push(g ? h('optgroup', { label: g }, items) : items);
-    opts.push(h('option', { value: CUSTOM_MODEL }, 'Custom model id…'));
-    sel.replaceChildren(...opts.flat());
-    sel.value = p.model || '';
     renderInfo();
+    if (!menu.classList.contains('hidden')) renderMenu();
+  }
+
+  function commit(id) {
+    id = id.trim();
+    input.value = id;
+    close();
+    if (id === p.model) return;
+    p.model = id;
+    renderInfo();
+    onChange();
+  }
+
+  function open() { menu.classList.remove('hidden'); renderMenu(); }
+  function close() { menu.classList.add('hidden'); active = -1; }
+
+  function renderMenu() {
+    const q = input.value.trim().toLowerCase();
+    // Show everything while the field still holds the current model; filter once the user types.
+    const filter = q && q !== (p.model || '').toLowerCase();
+    const matches = filter
+      ? models().filter(m => [m.id, m.name, m.group].some(v => v && v.toLowerCase().includes(q)))
+      : models();
+    rows = matches.slice(0, MAX_MODEL_ROWS);
+    const items = [];
+    let group;
+    rows.forEach((m, i) => {
+      if ((m.group || '') !== group) {
+        group = m.group || '';
+        if (group) items.push(h('div', { class: 'combo-group' }, group));
+      }
+      items.push(h('div', {
+        class: 'combo-item' + (m.id === p.model ? ' selected' : '') + (i === active ? ' active' : ''),
+        role: 'option',
+        onmousedown: e => { e.preventDefault(); commit(m.id); },
+      },
+        h('span', {}, m.name && m.name !== m.id ? m.name : m.id),
+        m.name && m.name !== m.id ? h('span', { class: 'muted mono small' }, ' ' + m.id) : null,
+        m.context ? h('span', { class: 'muted small' }, ` · ${Math.round(m.context / 1000)}k`) : null));
+    });
+    if (!matches.length) {
+      items.push(h('div', { class: 'combo-note' }, models().length
+        ? `No listed model matches — press Enter to use “${input.value.trim()}” as a custom id.`
+        : 'No model list available — type a model id.'));
+    } else if (matches.length > rows.length) {
+      items.push(h('div', { class: 'combo-note' }, `${matches.length - rows.length} more — keep typing to narrow down.`));
+    }
+    menu.replaceChildren(...items);
+    menu.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
   }
 
   function renderInfo() {
@@ -697,38 +728,40 @@ function modelPicker(p, onChange) {
     else if (list?.source === 'cli') parts.push(`${models().length} models from `, h('code', {}, list.via), '. ');
     else if (list?.source === 'api') parts.push(`${models().length} models (aliases + ${list.via}). `);
     else if (list?.note) parts.push(list.note + ' ');
+    if (p.model && list && !current()) parts.push(h('span', {}, 'Custom id (not in the list). '));
     parts.push(h('a', { href: 'javascript:void 0', onclick: () => load(true) }, '↻ refresh'));
     const m = current();
     if (m?.description) parts.push(h('div', {}, m.description));
     info.replaceChildren(...parts);
   }
 
-  sel.addEventListener('change', () => {
-    if (sel.value === CUSTOM_MODEL) {
-      custom.classList.remove('hidden');
-      custom.value = p.model;
-      custom.focus();
-      sel.value = p.model || '';
-      return;
+  input.addEventListener('focus', () => { input.select(); open(); });
+  input.addEventListener('input', () => { active = -1; open(); });
+  input.addEventListener('blur', () => commit(input.value));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (menu.classList.contains('hidden')) open();
+      if (!rows.length) return;
+      active = (active + (e.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length;
+      renderMenu();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      commit(active >= 0 && rows[active] ? rows[active].id : input.value);
+      input.blur();
+    } else if (e.key === 'Escape') {
+      input.value = p.model;
+      close();
+      input.blur();
     }
-    custom.classList.add('hidden');
-    p.model = sel.value;
-    renderInfo();
-    onChange();
-  });
-  custom.addEventListener('change', () => {
-    p.model = custom.value.trim();
-    custom.classList.add('hidden');
-    render();
-    onChange();
   });
 
   return {
-    el: h('div', {}, sel, custom, info),
+    el: h('div', { class: 'combo' }, input, menu, info),
     load,
     current,
     /** Called when the runtime changes: forget the old model and fetch the new list. */
-    reset() { p.model = ''; list = null; autoPick = true; render(); load(false); },
+    reset() { p.model = ''; input.value = ''; list = null; autoPick = true; renderInfo(); load(false); },
   };
 }
 
