@@ -25,7 +25,8 @@ you define in the web UI.
 ## Quick start
 
 ```bash
-cargo run --release            # http://127.0.0.1:7878
+cargo run --release            # web UI at http://127.0.0.1:7878
+cargo run --release -- tui     # terminal UI (see below)
 # options: --bind 0.0.0.0:7878 --data-dir ./data --config chimera.yaml
 ```
 
@@ -36,6 +37,36 @@ agent CLIs installed.
 Requirements: install and log in to the CLIs your personas use (`claude`, `codex`, `opencode`, `hermes`, `pi`). On Linux, also install bubblewrap (`bwrap`) so the process guard can keep agents away from your other programs.
 **Settings → Agent runtimes** shows which of them are on the server's `PATH`. To generate persona prompts,
 export the API key named in Settings (by default `DEEPSEEK_API_KEY`).
+
+## Terminal UI
+
+`chimera tui` runs the same workflow in the terminal: sessions list, new session (team, task, dry run), and a
+live session view with every agent's status and log, messaging and cancel.
+
+- If a Chimera server is already running at `--bind` (default `127.0.0.1:7878`), the TUI connects to it, and the
+  web UI and TUI show the same sessions live. Otherwise it starts the server inside its own process (the web UI
+  is then available too while the TUI runs; quitting asks for confirmation if sessions are still running, since
+  they stop with it). Logs go to `data/chimera.log` so they don't scribble over the screen.
+- `chimera tui --url http://host:7878` connects to a specific server and never starts one.
+
+```
+ ◐ Build a tiny URL shortener with a REST API   running
+   Software Development Team · 6 turns · /home/me/chimera/data/workspaces/20261010-035317-06681a
+╭ Agents ─────────────────────────────╮╭ Quinn (QA Engineer) — log ─────────────────────────────────╮
+│ ☰  Timeline                         ││← from Dana (Dev Lead)  03:53:20                             │
+│ ● Dana (Dev Lead) ENTRY             ││ ▏Please handle the QA part of the task: …                   │
+│   waiting · claude/opus · medium    ││──── turn #5 · 03:53:20 ────                                 │
+│▌● Quinn (QA Engineer)               ││▸ prompt (2930 chars) — p to show                            │
+│   running · opencode/… · medium     ││⚙ bash npm test                                              │
+╰─────────────────────────────────────╯╰─────────────────────────────────────────────────────────────╯
+ ↑↓ agent   PgUp/PgDn scroll   End follow   m message   p prompts   c cancel   Esc back
+```
+
+| Screen | Keys |
+|---|---|
+| Sessions | `↑↓` select · `Enter` open · `n` new session · `r` refresh · `q` quit |
+| New session | `↑↓` team · type or paste the task · `Ctrl+D` dry run · `Enter` start · `Esc` back |
+| Session | `↑↓` timeline / agent log · `PgUp`/`PgDn`/`Home`/`End` scroll · `m` message (to the selected agent, or ⚡ auto / the entry from the timeline; `Tab` changes the recipient) · `p` show prompts · `c` cancel · `Esc` back |
 
 ## The sample team
 
@@ -232,4 +263,4 @@ cargo clippy --all-targets
 Source map: `model.rs` (teams/graph), `config.rs` (runtimes and LLM settings), `runtime.rs` (process
 launching and output parsers), `orchestrator.rs` (scheduler, prompt building, message protocol, mock runtime),
 `session.rs` (state, events, persistence), `decisions.rs` (Jev client and decision questions), `catalog.rs` (model lists from CLIs), `promptgen.rs` (persona prompt generation), `web.rs` (API and SSE),
-`web/` (UI, embedded into the binary).
+`web/` (UI, embedded into the binary), `tui/` (terminal UI).
