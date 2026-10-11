@@ -195,7 +195,9 @@ function createGraph(wrap, team, opts = {}) {
     for (const p of team.personas) {
       const at = pos[p.id];
       const status = opts.statusOf ? opts.statusOf(p.id) : null;
-      const sub = [p.runtime, p.model, p.effort].filter(Boolean).join(' · ');
+      // A persona working on a fallback after a usage limit shows what it runs on now.
+      const active = opts.activeOf ? opts.activeOf(p.id) : null;
+      const sub = active ? '↯ ' + active : [p.runtime, p.model, p.effort].filter(Boolean).join(' · ');
       const g = h('g', {
         class: ['node', status, selected === p.id && 'selected', connectFrom === p.id && 'connect-src'].filter(Boolean).join(' '),
         transform: `translate(${at.x - NODE_W / 2},${at.y - NODE_H / 2})`,
@@ -203,11 +205,11 @@ function createGraph(wrap, team, opts = {}) {
         h('rect', { class: 'box', width: NODE_W, height: NODE_H }),
         h('rect', { class: 'stripe', x: 0, y: 8, width: 4, height: NODE_H - 16, fill: runtimeColor(p.runtime) }),
         h('text', { class: 'title', x: 14, y: 22 }, ellipsize(p.name, 22)),
-        h('text', { class: 'sub', x: 14, y: 39 }, ellipsize(sub, 28)),
+        h('text', { class: 'sub' + (active ? ' fallback' : ''), x: 14, y: 39 }, ellipsize(sub, 28)),
         status ? h('circle', { class: 'st', cx: 20, cy: 51, r: 4 }) : null,
         status ? h('text', { class: 'status', x: 29, y: 54.5 }, status) : null,
         p.id === team.entry ? h('text', { class: 'entry-mark', x: NODE_W - 10, y: 16, 'text-anchor': 'end' }, 'ENTRY') : null,
-        h('title', {}, `${p.name}\n${p.role || ''}\nid: ${p.id}`));
+        h('title', {}, `${p.name}\n${p.role || ''}\nid: ${p.id}` + (active ? `\non fallback: ${active}` : '')));
       nodeEls[p.id] = g;
       attachNodeEvents(g, p.id);
       nodesG.append(g);
@@ -413,6 +415,8 @@ async function sessionPage(id) {
   const events = [];
   let lastSeq = 0;
   const agentStatus = Object.fromEntries(Object.entries(summary.agents).map(([k, a]) => [k, a.status]));
+  // "runtime · model · effort" of personas running on a fallback after a usage limit.
+  const activeConfig = Object.fromEntries(Object.entries(summary.agents).filter(([, a]) => a.active).map(([k, a]) => [k, a.active]));
   let selected = null;
   let tab = 'timeline';
   const personaName = pid => pid === 'user' ? 'You' : (team.personas.find(p => p.id === pid)?.name || pid);
@@ -444,6 +448,7 @@ async function sessionPage(id) {
     h('div', { class: 'graph-hint' }, 'Click a persona to see its log'));
   const graph = createGraph(graphWrap, team, {
     statusOf: pid => agentStatus[pid] || 'idle',
+    activeOf: pid => activeConfig[pid],
     onSelect: pid => { selected = pid; tab = pid ? 'log' : 'timeline'; renderPanel(); },
   });
   onLeave(() => graph.destroy());
@@ -469,11 +474,15 @@ async function sessionPage(id) {
     sendBtn.disabled = false;
   }
 
+  const personaSub = p => activeConfig[p.id]
+    ? `${p.role || ''} · ↯ on fallback ${activeConfig[p.id]}`
+    : `${p.role || ''} · ${p.runtime}${p.model ? ' / ' + p.model : ''} · ${p.effort}`;
+
   function renderPanel() {
     const p = selected && team.personas.find(x => x.id === selected);
     if (p) {
       panelTitle.textContent = p.name;
-      panelSub.textContent = `${p.role || ''} · ${p.runtime}${p.model ? ' / ' + p.model : ''} · ${p.effort}`;
+      panelSub.textContent = personaSub(p);
       toSel.value = p.id;
       tabs.replaceChildren(
         h('button', { class: tab === 'log' ? 'active' : '', onclick: () => { tab = 'log'; renderPanel(); } }, 'Log'),
@@ -501,7 +510,7 @@ async function sessionPage(id) {
   }
 
   function matches(e) {
-    if (!selected) return ['message', 'final', 'session_status', 'decision', 'team_updated'].includes(e.type);
+    if (!selected) return ['message', 'final', 'session_status', 'decision', 'team_updated', 'fallback'].includes(e.type);
     if (e.type === 'team_updated') return e.changes.some(c => c.startsWith(selected));
     if (e.type === 'message') return e.from === selected || e.to === selected;
     return e.agent === selected && e.type !== 'agent_status';
@@ -525,6 +534,11 @@ async function sessionPage(id) {
       case 'team_updated':
         return h('div', { class: 'status-line team-updated' }, `✎ team updated · ${fmtTime(e.ts)}`,
           h('ul', {}, e.changes.filter(c => !selected || c.startsWith(selected)).map(c => h('li', {}, c))));
+      case 'fallback':
+        return h('div', { class: 'fallback-line' },
+          h('b', {}, `↯ ${personaName(e.agent)} ${e.level ? 'switched to a fallback' : 'is back on its primary'}`),
+          `: ${e.from} → ${e.to} · ${fmtTime(e.ts)}`,
+          h('div', { class: 'muted small' }, e.reason + (e.until ? ` (resets around ${new Date(e.until).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })})` : '')));
       case 'session_status':
         return h('div', { class: 'status-line' }, `session ${e.status}${e.detail ? ' — ' + e.detail : ''} · ${fmtTime(e.ts)}`);
       case 'turn_start':
@@ -571,6 +585,12 @@ async function sessionPage(id) {
     let rerender = false;
     if (e.type === 'agent_status') { agentStatus[e.agent] = e.status; graph.setStatus(e.agent, e.status); }
     if (e.type === 'session_status') { summary.status = e.status; summary.status_detail = e.detail; updateHeader(); }
+    if (e.type === 'fallback') {
+      if (e.level) activeConfig[e.agent] = e.to; else delete activeConfig[e.agent];
+      graph.render();
+      const p = team.personas.find(x => x.id === e.agent);
+      if (p && selected === e.agent) panelSub.textContent = personaSub(p);
+    }
     if (e.type === 'turn_start') { summary.total_turns = Math.max(summary.total_turns, e.turn); updateHeader(); }
     // The team was edited: reload it so the graph shows the new models.
     if (e.type === 'team_updated' && live) {
@@ -897,7 +917,7 @@ async function teamEditorPage(teamId) {
       h('div', {}, team.personas.map(p => h('div', { class: 'row', style: 'margin:4px 0' },
         h('span', { class: 'dot', style: `background:${runtimeColor(p.runtime)}` }),
         h('a', { href: 'javascript:void 0', onclick: () => { selection = { kind: 'persona', id: p.id }; graph.select(p.id); renderSide(); } }, p.name),
-        h('span', { class: 'muted small' }, `${p.runtime} · ${p.model || 'default model'} · ${p.effort}`)))));
+        h('span', { class: 'muted small' }, `${p.runtime} · ${p.model || 'default model'} · ${p.effort}` + (p.fallbacks?.length ? ` · ↯ ${p.fallbacks.map(f => f.runtime).join(', ')}` : ''))))));
   }
 
   const nameOf = id => team.personas.find(p => p.id === id)?.name || id;
@@ -980,6 +1000,39 @@ async function teamEditorPage(teamId) {
     });
     const rt = rts.find(r => r.name === p.runtime);
 
+    // Fallbacks: tried in order when the runtime above hits a usage, session or rate limit.
+    const fallbacksEl = h('div', { class: 'fallbacks' });
+    function renderFallbacks() {
+      const list = p.fallbacks || [];
+      fallbacksEl.replaceChildren(
+        ...list.map((f, i) => fallbackRow(f, i, list)),
+        h('button', {
+          class: 'small', onclick: () => {
+            const other = rts.find(r => r.name !== p.runtime && r.available && r.name !== 'mock') || rts.find(r => r.name !== p.runtime) || rts[0];
+            p.fallbacks = [...list, { runtime: other.name, model: '', effort: p.effort }];
+            changed(false);
+            renderFallbacks();
+          },
+        }, '+ Add fallback'));
+    }
+    function fallbackRow(f, i, list) {
+      const fp = modelPicker(f, () => changed(false));
+      const rtSel = h('select', { onchange: e => { f.runtime = e.target.value; fp.reset(); changed(false); } },
+        rts.map(r => h('option', { value: r.name }, `${r.label || r.name}${r.available ? '' : ' (not installed)'}`)));
+      rtSel.value = f.runtime;
+      const effSel = h('select', { onchange: e => { f.effort = e.target.value; changed(false); } }, EFFORTS.map(x => h('option', { value: x }, x)));
+      effSel.value = f.effort || 'medium';
+      fp.load(false);
+      const move = d => { const l = [...list]; [l[i], l[i + d]] = [l[i + d], l[i]]; p.fallbacks = l; changed(false); renderFallbacks(); };
+      return h('div', { class: 'fallback-row' },
+        h('div', { class: 'row' },
+          h('b', { class: 'small' }, `${i + 1}.`), rtSel, effSel,
+          h('button', { class: 'small', title: 'Try earlier', disabled: i === 0, onclick: () => move(-1) }, '↑'),
+          h('button', { class: 'small danger', title: 'Remove', onclick: () => { p.fallbacks = list.filter(x => x !== f); changed(false); renderFallbacks(); } }, '×')),
+        fp.el);
+    }
+    renderFallbacks();
+
     return h('div', {},
       h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, 'Persona'), h('button', { onclick: () => { selection = null; graph.select(null); renderSide(); } }, '×')),
       h('div', { class: 'grid', style: 'grid-template-columns:1fr 1fr;gap:0 10px' },
@@ -992,6 +1045,10 @@ async function teamEditorPage(teamId) {
       effortNote,
       h('label', {}, 'Model'), picker.el,
       rt && !rt.available ? h('div', { class: 'avail no' }, `“${rt.command}” was not found on PATH of the server.`) : null,
+      h('details', { class: 'fallback-box', open: !!(p.fallbacks || []).length },
+        h('summary', {}, 'Fallbacks on usage limits', (p.fallbacks || []).length ? h('span', { class: 'muted' }, ` (${p.fallbacks.length})`) : null),
+        h('div', { class: 'small muted' }, 'When the runtime above reports a usage, session or rate limit (e.g. Claude Code “usage limit reached”, Codex “you’ve hit your usage limit”), the persona retries the same messages on the first fallback that is not limited, and returns to its primary once the limit resets.'),
+        fallbacksEl),
       h('div', { class: 'gen-box' },
         h('div', { class: 'small muted' }, 'Describe the persona and let the configured LLM write its prompt (see Settings).'),
         desc,

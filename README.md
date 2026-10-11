@@ -70,15 +70,15 @@ live session view with every agent's status and log, messaging and cancel.
 
 ## The sample team
 
-| Persona | Runtime | Model | Effort |
-|---|---|---|---|
-| Dana, Dev Lead (**entry**) | claude | opus | medium |
-| Ari, Architect | claude | opus | high |
-| Ben, Backend Engineer | claude | sonnet | high |
-| Fiona, Frontend Engineer | codex | gpt-5.6-sol | high |
-| Quinn, QA Engineer | opencode | deepseek/deepseek-v4-flash | medium |
-| Sam, Security Reviewer | claude | opus | medium |
-| Tess, Technical Writer | hermes | anthropic/claude-sonnet-5-5 | low |
+| Persona | Runtime | Model | Effort | Fallbacks on usage limits |
+|---|---|---|---|---|
+| Dana, Dev Lead (**entry**) | claude | opus | medium | claude sonnet high → codex gpt-5.5 high |
+| Ari, Architect | claude | opus | high | |
+| Ben, Backend Engineer | claude | sonnet | high | codex gpt-5.5 high |
+| Fiona, Frontend Engineer | codex | gpt-5.6-sol | high | claude sonnet high |
+| Quinn, QA Engineer | opencode | deepseek/deepseek-v4-flash | medium | |
+| Sam, Security Reviewer | claude | opus | medium | |
+| Tess, Technical Writer | hermes | anthropic/claude-sonnet-5-5 | low | |
 
 The lead talks to everyone. The architect works with the engineers and security. Backend and frontend agree
 API contracts directly. QA files bugs with both engineers, and security sends fix requests to the engineers
@@ -112,6 +112,38 @@ team, from each persona's next turn (a turn already running finishes on the old 
 the session timeline, e.g. "qa: model x → y". A persona that changes CLI starts a fresh CLI session and receives its
 earlier conversation in the prompt; personas removed from the team stay in the session so its history remains
 valid. Untick **apply to existing sessions** next to **Save team** to change only new sessions.
+
+**Fallbacks on usage limits.** Each persona can list fallback runtime/model/effort combinations (team editor →
+persona → *Fallbacks on usage limits*, or `fallbacks:` in the team YAML):
+
+```yaml
+  - id: architect
+    runtime: claude
+    model: opus
+    effort: high
+    fallbacks:                                   # tried in order
+      - {runtime: claude, model: sonnet, effort: high}
+      - {runtime: codex, model: gpt-5.5, effort: high}
+```
+
+When a turn fails because the CLI reports a usage, session or rate limit (Claude Code's "Usage limit reached ·
+resets 3pm", Codex's "You've hit your usage limit. Try again in 4 days…", "429 Too Many Requests", "Quota
+exceeded", …), Chimera:
+
+1. records that runtime/model pair as limited until the reset time stated in the message (one hour if none is
+   given). This is shared by all sessions, so other personas on the same pair go straight to their fallbacks
+   instead of spending a turn on the limit;
+2. re-delivers the turn's messages to the persona on its first fallback that is not limited. The failed attempt
+   is not routed, its senders are not told about a failure, and it does not count against `max_turns`;
+3. on every later turn, uses the first configuration that is not limited, so the persona returns to its primary
+   once the limit has reset.
+
+Switching to another CLI starts a fresh CLI session and replays the persona's earlier turns in the prompt. Each
+switch appears in the timeline (↯), and the graph shows what the persona currently runs on. A persona without a
+usable fallback fails the turn as before, with a hint to add one. `GET /api/limits` lists the current limits and
+`DELETE /api/limits?runtime=claude` forgets them, so primaries are tried again right away. Each runtime's
+`limit_patterns` (case-insensitive phrases searched in a failed turn's error) can be overridden in
+`chimera.yaml`.
 
 **Workspace.** By default each session gets `data/workspaces/<session-id>`. You can also point a session at an
 existing repository. All personas of a session share this directory.
@@ -165,6 +197,7 @@ runtimes:
     output: claude-stream-json  # text | claude-stream-json | codex-json | opencode-json
     effort_map: { minimal: low } # translate effort levels per CLI ("" drops the flag)
     timeout_secs: 3600
+    limit_patterns: ["usage limit", "limit reached", "429", …]  # failed turns that switch to a fallback
     models_source: { kind: anthropic-api }   # where the persona editor gets the model list
     models: [opus, sonnet, haiku, fable]      # suggestions, and the fallback list
 ```
@@ -253,6 +286,7 @@ be resumed by sending it a message.
 | `POST /api/personas/generate` | generate a persona prompt with the configured LLM |
 | `GET/PUT /api/settings` | prompt-LLM and Jev settings (`{prompt_llm?, decisions?}`) |
 | `POST /api/decisions/test` | send a minimal request to Jev |
+| `GET/DELETE /api/limits?runtime=` | runtime/model pairs that hit a usage limit (personas use their fallbacks) / forget them |
 | `GET/POST /api/sessions` | list / start sessions (`{team_id, task, title?, workdir?, dry_run?}`) |
 | `GET/DELETE /api/sessions/{id}` | session summary and team snapshot / delete |
 | `GET /api/sessions/{id}/stream` | server-sent events: full history, then live events |

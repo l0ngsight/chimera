@@ -120,6 +120,18 @@ pub enum EventBody {
     TeamUpdated {
         changes: Vec<String>,
     },
+    /// A persona switched configuration: to a fallback after hitting a usage/rate limit, or
+    /// back towards its primary once that limit reset. `from`/`to` are "runtime · model · effort".
+    Fallback {
+        from: String,
+        to: String,
+        /// Fallback level now in use; 0 is the primary configuration.
+        level: usize,
+        reason: String,
+        /// When the limit that caused the switch is expected to reset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,9 +185,28 @@ pub struct AgentState {
     pub notes: Vec<String>,
     #[serde(default)]
     pub inbox: Vec<InboxMessage>,
+    /// Fallback level in use (0 = the persona's primary runtime/model/effort).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fallback: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl AgentState {
+    pub fn new() -> Self {
+        Self {
+            status: AgentStatus::Idle,
+            turns: 0,
+            native_session: None,
+            history: vec![],
+            notes: vec![],
+            inbox: vec![],
+            fallback: 0,
+        }
+    }
+
     /// Has messages that should start a turn.
     pub fn has_work(&self) -> bool {
         self.inbox.iter().any(|m| m.wake)
@@ -230,6 +261,11 @@ pub struct AgentSummary {
     pub status: AgentStatus,
     pub turns: u32,
     pub queued: usize,
+    /// Fallback level in use (0 = primary).
+    pub fallback: usize,
+    /// "runtime · model · effort" currently used, when that is a fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
 }
 
 /// State used only by the mock runtime to simulate delegation.
@@ -429,6 +465,12 @@ impl Inner {
                             status: a.status,
                             turns: a.turns,
                             queued: a.inbox.iter().filter(|m| m.wake).count(),
+                            fallback: a.fallback,
+                            active: m
+                                .team
+                                .persona(k)
+                                .filter(|p| a.fallback > 0 && a.fallback < p.levels())
+                                .map(|p| p.at_level(a.fallback).runtime_label()),
                         },
                     )
                 })

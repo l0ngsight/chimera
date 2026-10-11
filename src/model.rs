@@ -52,9 +52,58 @@ pub struct Persona {
     /// Extra environment variables for this persona's process.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Alternatives tried in order when the current runtime hits a usage, session or rate
+    /// limit (e.g. Claude Code's "usage limit reached"). The persona returns to its primary
+    /// runtime once the limit resets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<Fallback>,
     /// Position in the graph editor; auto-laid-out when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+}
+
+/// A harness, model and effort a persona switches to when its runtime is rate limited.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fallback {
+    pub runtime: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: Effort,
+    /// Replaces the persona's `extra_args` while the fallback is active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+}
+
+impl Persona {
+    /// The persona as it runs at a fallback level: 0 is the primary configuration, `n` is
+    /// `fallbacks[n - 1]`. Levels past the end resolve to the primary.
+    pub fn at_level(&self, level: usize) -> Persona {
+        let mut p = self.clone();
+        if let Some(f) = level.checked_sub(1).and_then(|i| self.fallbacks.get(i)) {
+            p.runtime = f.runtime.clone();
+            p.model = f.model.clone();
+            p.effort = f.effort;
+            p.extra_args = f.extra_args.clone();
+        }
+        p
+    }
+
+    /// The primary configuration followed by each fallback.
+    pub fn at_levels(&self) -> impl Iterator<Item = Persona> + '_ {
+        (0..self.levels()).map(|l| self.at_level(l))
+    }
+
+    /// Number of configurations (primary plus fallbacks).
+    pub fn levels(&self) -> usize {
+        1 + self.fallbacks.len()
+    }
+
+    /// "runtime · model · effort", for timelines and status lines.
+    pub fn runtime_label(&self) -> String {
+        let model = if self.model.is_empty() { "default model" } else { &self.model };
+        format!("{} · {} · {}", self.runtime, model, self.effort.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -134,6 +183,9 @@ impl Team {
             if !seen.insert(p.id.as_str()) {
                 return Err(format!("duplicate persona id '{}'", p.id));
             }
+            if p.fallbacks.iter().any(|f| f.runtime.trim().is_empty()) {
+                return Err(format!("persona '{}' has a fallback without a runtime", p.id));
+            }
         }
         if self.persona(&self.entry).is_none() {
             return Err(format!("entry persona '{}' does not exist", self.entry));
@@ -176,6 +228,7 @@ mod tests {
             prompt: String::new(),
             extra_args: vec![],
             env: Default::default(),
+            fallbacks: vec![],
             position: None,
         }
     }

@@ -257,10 +257,14 @@ fn draw_agents(f: &mut Frame, app: &App, v: &SessionView, area: Rect) {
             l1.push(Span::styled(" ENTRY", Style::new().fg(ACCENT)));
         }
         let model = if p.model.is_empty() { String::new() } else { format!("/{}", p.model) };
-        let l2 = Line::from(vec![
-            Span::styled(format!("  {} ", status_name(st)), Style::new().fg(agent_color(st))),
-            Span::styled(format!("· {}{model} · {} · {turns}t", p.runtime, p.effort.as_str()), Style::new().fg(DIM)),
-        ]);
+        let config = match v.fallback.get(&p.id) {
+            Some(active) => Span::styled(format!("· ↯ {active} · {turns}t"), Style::new().fg(Color::Yellow)),
+            None => {
+                Span::styled(format!("· {}{model} · {} · {turns}t", p.runtime, p.effort.as_str()), Style::new().fg(DIM))
+            }
+        };
+        let l2 =
+            Line::from(vec![Span::styled(format!("  {} ", status_name(st)), Style::new().fg(agent_color(st))), config]);
         let recipients: Vec<String> = v.team.recipients_of(&p.id).iter().map(|r| r.id.clone()).collect();
         let l3 = Line::from(format!("  → {}", if recipients.is_empty() { "—".into() } else { recipients.join(", ") }))
             .fg(DIM);
@@ -320,6 +324,7 @@ fn log_lines<'a>(v: &'a SessionView, who: Option<&str>) -> Vec<Line<'a>> {
                 | EventBody::Final { .. }
                 | EventBody::SessionStatus { .. }
                 | EventBody::Decision { .. }
+                | EventBody::Fallback { .. }
                 | EventBody::TeamUpdated { .. },
             ) => true,
             (None, _) => false,
@@ -445,6 +450,16 @@ fn event_lines<'a>(v: &'a SessionView, who: Option<&str>, ev: &'a Event, out: &m
             for c in changes.iter().filter(|c| who.is_none_or(|a| c.starts_with(a))) {
                 out.push(Line::from(format!("   {c}")).fg(MUTED));
             }
+        }
+        EventBody::Fallback { from, to, level, reason, until } => {
+            let who = name_of(v, ev.agent.as_deref().unwrap_or("?"));
+            let what = if *level == 0 { "back on its primary" } else { "switched to a fallback" };
+            out.push(Line::default());
+            out.push(Line::from(format!("↯ {who} {what}: {from} → {to} · {}", time(ev))).fg(Color::Yellow).bold());
+            let until = until
+                .map(|u| format!(" (resets around {})", u.with_timezone(&chrono::Local).format("%a %H:%M")))
+                .unwrap_or_default();
+            out.push(Line::from(format!("   {reason}{until}")).fg(MUTED));
         }
         EventBody::AgentStatus { .. } => {}
     }

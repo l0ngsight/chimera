@@ -2,6 +2,7 @@ mod catalog;
 mod config;
 mod decisions;
 mod guard;
+mod limits;
 mod model;
 mod orchestrator;
 mod promptgen;
@@ -175,6 +176,7 @@ async fn build_state(cfg: &Config) -> anyhow::Result<Arc<AppState>> {
         decisions: RwLock::new(decisions_cfg),
         jev: decisions::Jev::new(),
         guard: guard::Guard::new(guard_enabled),
+        limits: Default::default(),
     });
     orchestrator.guard.self_test().await;
     let gs = orchestrator.guard.status();

@@ -89,6 +89,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/personas/generate", post(generate_persona))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/decisions/test", post(test_decisions))
+        .route("/api/limits", get(list_limits).delete(clear_limits))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", get(get_session).delete(delete_session))
         .route("/api/sessions/{id}/events", get(session_events))
@@ -305,6 +306,22 @@ async fn test_decisions(State(st): State<Arc<AppState>>) -> AppResult<Json<serde
     let cfg = st.orchestrator.decisions.read().unwrap().clone();
     let v = st.orchestrator.jev.ping(&cfg).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(json!({ "model": v.model, "latency_ms": v.latency_ms, "cost": v.cost, "answer": v.value })))
+}
+
+/// Runtime/model pairs currently known to be rate limited (personas use their fallbacks).
+async fn list_limits(State(st): State<Arc<AppState>>) -> Json<Vec<crate::limits::LimitEntry>> {
+    Json(st.orchestrator.limits.list(chrono::Utc::now()))
+}
+
+#[derive(Deserialize)]
+struct ClearLimitsQuery {
+    runtime: Option<String>,
+}
+
+/// Forgets limits so personas try their primary runtime again on their next turn.
+async fn clear_limits(State(st): State<Arc<AppState>>, Query(q): Query<ClearLimitsQuery>) -> StatusCode {
+    st.orchestrator.limits.clear(q.runtime.as_deref());
+    StatusCode::NO_CONTENT
 }
 
 async fn list_sessions(State(st): State<Arc<AppState>>) -> Json<Vec<crate::session::SessionSummary>> {

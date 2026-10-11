@@ -110,12 +110,39 @@ pub struct RuntimeSpec {
     /// Off for CLIs that apply their own macOS sandbox, which cannot be nested.
     #[serde(default = "default_true")]
     pub guard: bool,
+    /// Case-insensitive phrases that mark a failed turn as a usage/rate limit, which switches
+    /// the persona to its next fallback (see `Persona::fallbacks`).
+    #[serde(default = "default_limit_patterns")]
+    pub limit_patterns: Vec<String>,
     /// Where the persona editor gets this runtime's model list from.
     #[serde(default)]
     pub models_source: ModelsSource,
     /// Model suggestions for the UI (also the fallback when `models_source` fails).
     #[serde(default)]
     pub models: Vec<String>,
+}
+
+/// Phrases Claude Code, Codex, opencode and pi print when a plan, session or rate limit is hit,
+/// e.g. "Usage limit reached · limit resets 3pm", "You've hit your usage limit. Try again in 4 days",
+/// "Quota exceeded", "429 Too Many Requests", "Credit balance is too low".
+pub const DEFAULT_LIMIT_PATTERNS: &[&str] = &[
+    "usage limit",
+    "limit reached",
+    "hit your limit",
+    "out of extra usage",
+    "rate limit",
+    "rate_limit",
+    "quota",
+    "too many requests",
+    "429",
+    "credit balance",
+    "out of credits",
+    "insufficient credits",
+    "insufficient_quota",
+];
+
+pub fn default_limit_patterns() -> Vec<String> {
+    DEFAULT_LIMIT_PATTERNS.iter().map(|s| s.to_string()).collect()
 }
 
 fn default_true() -> bool {
@@ -269,6 +296,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
             guard: true,
+            limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::AnthropicApi { api_key_env: default_anthropic_key_env() },
             models: vec!["opus".into(), "sonnet".into(), "haiku".into(), "fable".into()],
         },
@@ -303,6 +331,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             // On macOS Codex applies its own seatbelt sandbox (which already blocks outside
             // signals) and seatbelt sandboxes cannot be nested. On Linux nesting works.
             guard: !cfg!(target_os = "macos"),
+            limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::Command {
                 args: vec!["debug".into(), "models".into()],
                 format: ModelsFormat::CodexCatalog,
@@ -334,6 +363,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
             guard: true,
+            limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::Command {
                 args: vec!["models".into(), "--verbose".into()],
                 format: ModelsFormat::OpencodeVerbose,
@@ -359,6 +389,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
             guard: true,
+            limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::Static,
             models: vec!["anthropic/claude-opus-5-5".into(), "nousresearch/hermes-4-405b".into()],
         },
@@ -386,6 +417,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
             guard: true,
+            limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::Command { args: vec!["--list-models".into()], format: ModelsFormat::PiTable },
             models: vec!["anthropic/claude-sonnet-5-5".into(), "openai/gpt-5.5".into()],
         },
@@ -404,6 +436,7 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             env: BTreeMap::new(),
             timeout_secs: 60,
             guard: false,
+            limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::Static,
             models: vec!["mock".into()],
         },

@@ -33,6 +33,8 @@ pub struct Orchestrator {
     pub jev: Jev,
     /// OS sandbox that keeps agents from killing or quitting the user's programs.
     pub guard: crate::guard::Guard,
+    /// Runtime/model pairs that hit a usage or rate limit, shared by all sessions.
+    pub limits: crate::limits::Limits,
 }
 
 /// A message produced by a turn, after recipient resolution and ack filtering.
@@ -76,24 +78,7 @@ impl Orchestrator {
             .title
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| truncate(req.task.lines().next().unwrap_or("session"), 80));
-        let agents = req
-            .team
-            .personas
-            .iter()
-            .map(|p| {
-                (
-                    p.id.clone(),
-                    AgentState {
-                        status: AgentStatus::Idle,
-                        turns: 0,
-                        native_session: None,
-                        history: vec![],
-                        notes: vec![],
-                        inbox: vec![],
-                    },
-                )
-            })
-            .collect();
+        let agents = req.team.personas.iter().map(|p| (p.id.clone(), AgentState::new())).collect();
         let meta = SessionMeta {
             id: id.clone(),
             title,
@@ -292,18 +277,15 @@ impl Orchestrator {
             merged.personas.iter().filter(|p| team.persona(&p.id).is_none()).map(|p| p.id.clone()).collect();
         inner.meta.retired = now_retired;
         for p in &merged.personas {
-            let agent = inner.meta.agents.entry(p.id.clone()).or_insert_with(|| AgentState {
-                status: AgentStatus::Idle,
-                turns: 0,
-                native_session: None,
-                history: vec![],
-                notes: vec![],
-                inbox: vec![],
-            });
+            let agent = inner.meta.agents.entry(p.id.clone()).or_insert_with(AgentState::new);
             // A native CLI session cannot move to another CLI; the next turn starts a fresh one
             // and the persona's history is replayed in its prompt instead.
-            if old.persona(&p.id).is_some_and(|o| o.runtime != p.runtime) {
+            let level = agent.fallback;
+            if old.persona(&p.id).is_some_and(|o| o.at_level(level).runtime != p.at_level(level).runtime) {
                 agent.native_session = None;
+            }
+            if level >= p.levels() {
+                agent.fallback = 0;
             }
         }
         inner.meta.team = merged;
@@ -389,7 +371,57 @@ impl Orchestrator {
         }
     }
 
-    fn start_turn(self: &Arc<Self>, session: &Arc<Session>, inner: &mut Inner, persona: Persona) {
+    /// The first configuration of `persona` (primary, then fallbacks in order) that is not
+    /// known to be rate limited. When every one is limited, the primary is tried anyway.
+    fn choose_level(&self, persona: &Persona) -> usize {
+        let now = Utc::now();
+        (0..persona.levels())
+            .find(|&l| {
+                let p = persona.at_level(l);
+                self.limits.limited_until(&p.runtime, &p.model, now).is_none()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Moves a persona to fallback `level`, starting a fresh CLI session if the runtime changes.
+    fn set_level(
+        &self,
+        session: &Session,
+        inner: &mut Inner,
+        primary: &Persona,
+        level: usize,
+        reason: String,
+        until: Option<chrono::DateTime<Utc>>,
+    ) {
+        let agent = inner.meta.agents.get_mut(&primary.id).expect("agent exists");
+        let (old, new) = (primary.at_level(agent.fallback), primary.at_level(level));
+        if old.runtime != new.runtime {
+            agent.native_session = None;
+        }
+        agent.fallback = level;
+        let body = EventBody::Fallback { from: old.runtime_label(), to: new.runtime_label(), level, reason, until };
+        session.emit_locked(inner, Some(&primary.id), body);
+    }
+
+    fn start_turn(self: &Arc<Self>, session: &Arc<Session>, inner: &mut Inner, primary: Persona) {
+        // Use the first configuration that is not rate limited; this also returns a persona to
+        // its primary once the limit that moved it to a fallback has reset.
+        let level = if inner.meta.dry_run { 0 } else { self.choose_level(&primary) };
+        let current = inner.meta.agents[&primary.id].fallback;
+        if level != current {
+            let reason = if level < current {
+                format!("{} is no longer rate limited", primary.at_level(level).runtime_label())
+            } else {
+                format!("{} is rate limited", primary.at_level(current).runtime_label())
+            };
+            let until = (level > current).then(|| {
+                let p = primary.at_level(current);
+                self.limits.limited_until(&p.runtime, &p.model, Utc::now())
+            });
+            self.set_level(session, inner, &primary, level, reason, until.flatten());
+        }
+        let persona = primary.at_level(level);
+
         let runtime_name = if inner.meta.dry_run { "mock".to_string() } else { persona.runtime.clone() };
         let spec = self.runtimes.get(&runtime_name).cloned();
         inner.meta.round_turns += 1;
@@ -436,6 +468,7 @@ impl Orchestrator {
                     fwd_session.emit(Some(&pid), EventBody::Log { kind: l.kind, text: l.text });
                 }
             });
+            let process_spec = spec.clone().filter(|s| s.kind == RuntimeKind::Process);
             let output = match spec {
                 None => TurnOutput {
                     error: Some(format!("unknown runtime '{runtime_name}' (check chimera.yaml)")),
@@ -463,9 +496,74 @@ impl Orchestrator {
             };
             let _ = forward.await;
             let elapsed = started.elapsed();
+            if let Some(spec) = process_spec
+                && let Some(reason) = crate::limits::detect(&spec, &output)
+                && orch.on_limit(&session, &primary, level, &reason, (turn, &incoming, &notes, &output, elapsed))
+            {
+                return;
+            }
             let routed = orch.route_output(&session, &team, &persona, &output).await;
             complete_turn(&session, &persona, turn, incoming, output, routed, elapsed);
         });
+    }
+
+    /// A turn failed on a usage/rate limit: remembers the limit and, if the persona has a
+    /// fallback that is not limited, re-queues the turn's messages for it. Returns whether the
+    /// turn was handed to a fallback (otherwise it completes as a normal failure).
+    fn on_limit(
+        &self,
+        session: &Arc<Session>,
+        primary: &Persona,
+        level: usize,
+        reason: &str,
+        (turn, incoming, notes, output, elapsed): (u32, &[InboxMessage], &[String], &TurnOutput, Duration),
+    ) -> bool {
+        let now = Utc::now();
+        let until = crate::limits::reset_time(reason, now);
+        let failed = primary.at_level(level);
+        self.limits.record(&failed.runtime, &failed.model, until);
+        tracing::info!(persona = %primary.id, "{} rate limited until {until}: {reason}", failed.runtime_label());
+        let next = (level + 1..primary.levels()).find(|&l| {
+            let p = primary.at_level(l);
+            self.limits.limited_until(&p.runtime, &p.model, now).is_none()
+        });
+
+        let mut inner = session.lock();
+        let Some(next) = next.filter(|_| inner.stopping.is_none()) else {
+            let hint = if primary.fallbacks.is_empty() {
+                "Add a fallback runtime/model to this persona in the team editor to keep working through limits."
+            } else {
+                "Every fallback of this persona is rate limited too."
+            };
+            let text = format!(
+                "{} hit a usage limit (resets around {}). {hint}",
+                failed.runtime_label(),
+                until.with_timezone(&chrono::Local).format("%a %H:%M")
+            );
+            session.emit_locked(&mut inner, Some(&primary.id), EventBody::Log { kind: LogKind::Info, text });
+            return false;
+        };
+
+        let id = primary.id.as_str();
+        let err = output.error.clone().unwrap_or_default();
+        session.emit_locked(&mut inner, Some(id), EventBody::Log { kind: LogKind::Error, text: err.clone() });
+        let duration_ms = elapsed.as_millis() as u64;
+        session.emit_locked(&mut inner, Some(id), EventBody::TurnEnd { turn, duration_ms, error: Some(err) });
+        let reason = format!("{} hit a limit: {}", failed.runtime_label(), truncate(reason, 300));
+        self.set_level(session, &mut inner, primary, next, reason, Some(until));
+        // The turn did not happen as far as the team is concerned: its messages go back to the
+        // front of the inbox and the fallback handles them next.
+        inner.meta.round_turns = inner.meta.round_turns.saturating_sub(1);
+        let agent = inner.meta.agents.get_mut(id).expect("agent exists");
+        agent.inbox.splice(0..0, incoming.iter().cloned());
+        agent.notes.splice(0..0, notes.iter().cloned());
+        agent.status = AgentStatus::Queued;
+        session.emit_locked(&mut inner, Some(id), EventBody::AgentStatus { status: AgentStatus::Queued });
+        inner.running.remove(id);
+        inner.save(&session.dir);
+        drop(inner);
+        session.wake.notify_one();
+        true
     }
 }
 
@@ -492,6 +590,10 @@ fn team_changes(old: &Team, merged: &Team, edited: &Team, retired: &std::collect
         }
         if o.name != p.name || o.role != p.role {
             out.push(format!("{id}: renamed to {} ({})", p.name, p.role));
+        }
+        if o.fallbacks != p.fallbacks {
+            let list: Vec<String> = p.at_levels().skip(1).map(|f| f.runtime_label()).collect();
+            out.push(format!("{id}: fallbacks {}", if list.is_empty() { "removed".into() } else { list.join(" → ") }));
         }
         if o.extra_args != p.extra_args || o.env != p.env {
             out.push(format!("{id}: CLI arguments or environment updated"));
@@ -1047,23 +1149,7 @@ mod tests {
             id: "s".into(),
             title: "t".into(),
             task: "do it".into(),
-            agents: team
-                .personas
-                .iter()
-                .map(|p| {
-                    (
-                        p.id.clone(),
-                        AgentState {
-                            status: AgentStatus::Idle,
-                            turns: 0,
-                            native_session: None,
-                            history: vec![],
-                            notes: vec![],
-                            inbox: vec![],
-                        },
-                    )
-                })
-                .collect(),
+            agents: team.personas.iter().map(|p| (p.id.clone(), AgentState::new())).collect(),
             team: team.clone(),
             workdir: PathBuf::from("/tmp"),
             dry_run: false,
@@ -1127,6 +1213,7 @@ mod e2e_tests {
             decisions: RwLock::new(decisions),
             jev: Jev::new(),
             guard: crate::guard::Guard::new(false),
+            limits: Default::default(),
         })
     }
 
@@ -1412,6 +1499,97 @@ mod e2e_tests {
         orch.post_message(&session, "a", "again").unwrap();
         assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
         assert_eq!(session.lock().meta.final_answer.as_deref(), Some("model=m2"));
+    }
+
+    /// A persona whose runtime hits a usage limit continues on its fallback, and returns to
+    /// its primary once the limit has reset.
+    #[tokio::test]
+    async fn usage_limits_switch_personas_to_their_fallbacks() {
+        let flag = temp_dir().join("limited");
+        std::fs::write(&flag, "").unwrap();
+        let mut rts = builtin_runtimes();
+        let base = rts["hermes"].clone();
+        // Fails like Claude Code on a usage limit while the flag file exists.
+        let script = format!(
+            "cat > /dev/null; if [ -e '{}' ]; then echo 'Usage limit reached · limit resets 3pm' >&2; exit 1; fi; \
+             printf '<final>primary %s</final>' \"$0\"",
+            flag.display()
+        );
+        rts.insert(
+            "limited".into(),
+            RuntimeSpec {
+                label: "limited".into(),
+                command: "sh".into(),
+                args: vec![ArgItem::One("-c".into()), ArgItem::One(script), ArgItem::Group(vec!["{model}".into()])],
+                output: OutputFormat::Text,
+                ..base.clone()
+            },
+        );
+        rts.insert(
+            "backup".into(),
+            RuntimeSpec {
+                label: "backup".into(),
+                command: "sh".into(),
+                args: vec![
+                    ArgItem::One("-c".into()),
+                    ArgItem::One("cat > /dev/null; printf '<final>backup %s %s</final>' \"$0\" \"$1\"".into()),
+                    ArgItem::Group(vec!["{model}".into()]),
+                    ArgItem::Group(vec!["{effort}".into()]),
+                ],
+                output: OutputFormat::Text,
+                ..base.clone()
+            },
+        );
+        let team: Team = serde_yaml::from_str(
+            "id: t\nname: T\nentry: a\npersonas:\n  - id: a\n    name: A\n    runtime: limited\n    model: big\n    fallbacks:\n      - {runtime: limited, model: big}\n      - {runtime: backup, model: small, effort: low}\n  - {id: b, name: B, runtime: limited, model: big}\n",
+        )
+        .unwrap();
+        let orch = orchestrator(rts);
+        let session = orch
+            .create_session(NewSession { team, task: "go".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        {
+            let inner = session.lock();
+            // The first fallback uses the same limited pair, so it is skipped.
+            assert_eq!(inner.meta.final_answer.as_deref(), Some("backup small low"));
+            let a = &inner.meta.agents["a"];
+            assert_eq!(a.fallback, 2);
+            assert_eq!(a.history.len(), 1, "the limited attempt is not part of the history");
+            assert_eq!(a.history[0].incoming[0].content, "go", "the task was re-delivered to the fallback");
+            let switches: Vec<(usize, &str)> = inner
+                .events
+                .iter()
+                .filter_map(|e| match &e.body {
+                    EventBody::Fallback { level, to, .. } => Some((*level, to.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(switches, vec![(2, "backup · small · low")]);
+            assert_eq!(inner.summary().agents["a"].active.as_deref(), Some("backup · small · low"));
+        }
+        assert!(orch.limits.limited_until("limited", "big", Utc::now()).is_some());
+
+        // Without a fallback the turn fails, with a hint to configure one.
+        orch.post_message(&session, "b", "hello").unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Idle);
+        {
+            let inner = session.lock();
+            assert_eq!(inner.meta.agents["b"].status, AgentStatus::Error);
+            assert!(inner.events.iter().any(
+                |e| matches!(&e.body, EventBody::Log { kind: LogKind::Info, text } if text.contains("Add a fallback"))
+            ));
+        }
+
+        // Once the limit resets, the persona is back on its primary.
+        std::fs::remove_file(&flag).unwrap();
+        orch.limits.clear(None);
+        orch.post_message(&session, "a", "again").unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        let inner = session.lock();
+        assert_eq!(inner.meta.final_answer.as_deref(), Some("primary big"));
+        assert_eq!(inner.meta.agents["a"].fallback, 0);
+        assert!(inner.events.iter().any(|e| matches!(&e.body, EventBody::Fallback { level: 0, .. })));
     }
 
     #[tokio::test]

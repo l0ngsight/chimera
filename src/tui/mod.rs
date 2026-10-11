@@ -55,6 +55,8 @@ pub struct SessionView {
     pub agent_status: HashMap<String, AgentStatus>,
     /// Turns per persona, counted from the (replayed) event stream.
     pub turns: HashMap<String, u32>,
+    /// Personas running on a fallback after a usage limit: "runtime · model · effort".
+    pub fallback: HashMap<String, String>,
     /// 0 = timeline, 1.. = personas in team order.
     pub selected: usize,
     /// Lines scrolled up from the bottom; 0 follows new output.
@@ -87,6 +89,15 @@ impl SessionView {
             }
             EventBody::TurnStart { turn } => self.summary.total_turns = self.summary.total_turns.max(*turn),
             EventBody::Final { content } => self.summary.final_answer = Some(content.clone()),
+            EventBody::Fallback { to, level, .. } => {
+                if let Some(a) = &ev.agent {
+                    if *level == 0 {
+                        self.fallback.remove(a);
+                    } else {
+                        self.fallback.insert(a.clone(), to.clone());
+                    }
+                }
+            }
             _ => {}
         }
         if let (Some(a), EventBody::TurnStart { .. }) = (&ev.agent, &ev.body) {
@@ -263,6 +274,7 @@ impl App {
                     id: d.summary.id.clone(),
                     agent_status: d.summary.agents.iter().map(|(k, a)| (k.clone(), a.status)).collect(),
                     turns: HashMap::new(),
+                    fallback: HashMap::new(),
                     team: d.team,
                     summary: d.summary,
                     events: vec![],
@@ -545,6 +557,7 @@ mod tests {
             last_seq: 0,
             agent_status: HashMap::from([("dev_lead".to_string(), AgentStatus::Running)]),
             turns: HashMap::new(),
+            fallback: HashMap::new(),
             selected: 0,
             scroll: 0,
             show_prompts: false,

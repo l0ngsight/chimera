@@ -573,6 +573,7 @@ mod tests {
             prompt: String::new(),
             extra_args: vec!["--foo".into()],
             env: Default::default(),
+            fallbacks: vec![],
             position: None,
         }
     }
