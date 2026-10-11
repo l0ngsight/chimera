@@ -1,0 +1,12 @@
+{"type":"session.start","id":"e1","parentId":null,"timestamp":"2026-10-11T12:00:00Z","data":{"sessionId":"0cb916db-26aa-40f2-86b5-1ba81b225fd2","selectedModel":"gpt-5.3-codex"}}
+{"type":"assistant.turn_start","id":"e2","parentId":"e1","timestamp":"2026-10-11T12:00:01Z","data":{"turnId":"t1"}}
+{"type":"assistant.reasoning","id":"e3","parentId":"e2","timestamp":"2026-10-11T12:00:02Z","data":{"reasoningId":"r1","content":"Need to look at the routes first."}}
+{"type":"assistant.message_delta","id":"e4","parentId":"e2","timestamp":"2026-10-11T12:00:02Z","ephemeral":true,"data":{"messageId":"m1","deltaContent":"I'll"}}
+{"type":"assistant.message","id":"e5","parentId":"e2","timestamp":"2026-10-11T12:00:03Z","data":{"messageId":"m1","content":"I'll add the endpoint.","toolRequests":[{"toolCallId":"c1","name":"bash"}]}}
+{"type":"tool.execution_start","id":"e6","parentId":"e5","timestamp":"2026-10-11T12:00:03Z","data":{"toolCallId":"c1","toolName":"bash","arguments":{"command":"cargo test"}}}
+{"type":"tool.execution_complete","id":"e7","parentId":"e6","timestamp":"2026-10-11T12:00:09Z","data":{"toolCallId":"c1","success":true,"result":{"content":"test result: ok. 12 passed"}}}
+{"type":"tool.execution_complete","id":"e8","parentId":"e6","timestamp":"2026-10-11T12:00:10Z","data":{"toolCallId":"c2","success":false,"error":{"message":"Permission denied: shell(pkill)"}}}
+{"type":"assistant.message","id":"e9","parentId":"e2","timestamp":"2026-10-11T12:00:11Z","data":{"messageId":"m9","parentToolCallId":"c3","content":"subagent chatter"}}
+{"type":"assistant.usage","id":"e10","parentId":"e2","timestamp":"2026-10-11T12:00:12Z","ephemeral":true,"data":{"model":"gpt-5.3-codex","cost":0.25}}
+{"type":"assistant.message","id":"e11","parentId":"e2","timestamp":"2026-10-11T12:00:12Z","data":{"messageId":"m2","content":"<message to=\"qa\">POST /links is ready, tests pass.</message>"}}
+{"type":"assistant.turn_end","id":"e12","parentId":"e2","timestamp":"2026-10-11T12:00:12Z","data":{"turnId":"t1"}}

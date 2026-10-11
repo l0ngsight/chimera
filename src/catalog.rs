@@ -206,6 +206,7 @@ pub fn parse(format: ModelsFormat, out: &str) -> anyhow::Result<Vec<ModelInfo>> 
         ModelsFormat::CodexCatalog => parse_codex(out)?,
         ModelsFormat::OpencodeVerbose => parse_opencode_verbose(out),
         ModelsFormat::PiTable => parse_pi_table(out),
+        ModelsFormat::CopilotConfig => parse_copilot_config(out),
     })
 }
 
@@ -302,6 +303,26 @@ fn parse_pi_table(out: &str) -> Vec<ModelInfo> {
         .collect()
 }
 
+/// `copilot help config` lists the accepted values of each setting; the `model` setting reads
+/// `  \`model\`: AI model to use …` followed by `    - "claude-sonnet-5"` lines.
+fn parse_copilot_config(out: &str) -> Vec<ModelInfo> {
+    out.lines()
+        .skip_while(|l| !l.trim_start().starts_with("`model`:"))
+        .skip(1)
+        .map_while(|l| l.trim().strip_prefix("- \"").and_then(|r| r.strip_suffix('"')))
+        .map(|id| {
+            let vendor = match id.split('-').next().unwrap_or_default() {
+                "claude" => "Anthropic",
+                "gpt" => "OpenAI",
+                "gemini" => "Google",
+                "grok" => "xAI",
+                _ => "Other",
+            };
+            ModelInfo { group: Some(vendor.into()), ..ModelInfo::id(id) }
+        })
+        .collect()
+}
+
 /// "1M", "300K", "65.5K", "128000" → tokens.
 fn parse_size(s: &str) -> Option<u64> {
     let (num, mult) = match s.chars().last()? {
@@ -349,6 +370,17 @@ fn provider_of(id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parses_copilot_model_choices() {
+        let models = parse(ModelsFormat::CopilotConfig, include_str!("../testdata/copilot-help-config.txt")).unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        for id in ["claude-sonnet-5", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5-mini"] {
+            assert!(ids.contains(&id), "{id} missing from {ids:?}");
+        }
+        assert_eq!(models[0].group.as_deref(), Some("Anthropic"));
+        assert!(models.iter().all(|m| !m.id.contains('"') && !m.id.contains(' ')));
+    }
 
     #[test]
     fn parses_codex_catalog_and_skips_hidden_models() {

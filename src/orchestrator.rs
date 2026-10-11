@@ -1275,10 +1275,16 @@ mod e2e_tests {
 
     #[tokio::test]
     async fn dry_run_of_sample_team_completes() {
+        for (_, yaml) in crate::store::SAMPLE_TEAMS {
+            dry_run_completes(serde_yaml::from_str(yaml).unwrap()).await;
+        }
+    }
+
+    async fn dry_run_completes(team: Team) {
         let orch = orchestrator(builtin_runtimes());
         let session = orch
             .create_session(NewSession {
-                team: sample_team(),
+                team,
                 task: "Build a todo app".into(),
                 title: None,
                 workdir: None,

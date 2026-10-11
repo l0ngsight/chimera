@@ -85,6 +85,33 @@ API contracts directly. QA files bugs with both engineers, and security sends fi
 (one-way). See [`teams/software-dev.yaml`](teams/software-dev.yaml). Model names are free text: change them
 in the editor to whatever your CLIs accept.
 
+### SCB Software Engineering Team
+
+A second sample, [`teams/scb-software-engineering.yaml`](teams/scb-software-engineering.yaml), for an
+environment where every agent must go through **GitHub Copilot CLI** with a fixed set of approved models. The
+prompts are written for a regulated bank: small reviewable changes, tests with every change, no secrets or
+customer data in code or logs, an audit trail, and a security & compliance gate before delivery.
+
+| Persona | Model (context) | Effort | Why | Fallbacks |
+|---|---|---|---|---|
+| Priya, Dev Lead (**entry**) | gpt-5.4 (1.1M) | medium | holds the plan and every report; coordination needs judgement more than depth | gpt-5.6-luna → claude-sonnet-5 |
+| Arjun, Architect | gpt-5.6-luna (1.1M) | high | strongest reasoning in the set; reads the whole codebase | claude-sonnet-5 → gpt-5.4 |
+| Ben, Backend Engineer | gpt-5.3-codex (400K) | high | the coding-specialised model | claude-sonnet-5 → gpt-5.4 |
+| Fiona, Frontend Engineer | claude-sonnet-5 (1M) | medium | strong UI work; most of it does not need high effort | gpt-5.3-codex → gpt-5.4 |
+| Quinn, QA Engineer | gpt-5.4-mini (400K) | medium | many fast write-run-fix iterations, room for test logs | gpt-5-mini → gpt-5.4 (low) |
+| Sam, Security & Compliance | claude-sonnet-5 (1M) | high | a different model family from the code's authors gives an independent review | gpt-5.6-luna → gpt-5.4 |
+| Tara, Technical Writer | gpt-5-mini (192K) | low | documentation is high-volume and low-risk | gpt-5.4-mini |
+
+All fallbacks stay on Copilot and the approved models, so a Copilot rate limit on one model (e.g. a weekly
+per-model limit) moves the persona to another approved model. `max_parallel` is 3 to pace premium-request
+usage. Log in once with `copilot` → `/login` (or set `COPILOT_GITHUB_TOKEN`) on the machine running Chimera.
+Copilot restricts file access to the workspace and the temp directory, and unattended runs cannot approve URL access; add
+`--allow-all-urls` or `--allow-url=…` to a persona's *Extra CLI arguments* if your policy permits network
+access from agents.
+
+Sample teams are written to `data/teams` once, also on existing installs when a new sample ships; deleting
+one is permanent (`data/teams/.samples` records which were offered).
+
 ## How a session runs
 
 1. The task is delivered to the team's **entry persona** as a message from the user.
@@ -217,6 +244,7 @@ Built-in defaults:
 | `opencode` | `opencode run --auto --model M --variant E --format json "<prompt>"` (`--auto` approves permission requests that are not explicitly denied; without it opencode auto-rejects them, e.g. access to `/tmp`) | text, reasoning, tool use |
 | `hermes` | `hermes chat --model M -q "<prompt>"` | plain text |
 | `pi` | `pi -p --mode json --model M --thinking E --session-id S` (prompt on stdin; the same `--session-id` continues the session) | text, thinking, tool calls/results, cost, errors and retries |
+| `copilot` | `copilot --model M --reasoning-effort E --session-id S --output-format json --allow-all-tools --no-ask-user --no-auto-update --deny-tool=shell(pkill) …` (GitHub Copilot CLI; prompt on stdin; the same `--session-id` continues the session) | text, reasoning, tool calls/results, errors incl. `rate_limit`/`quota` |
 | `mock` | built in | simulated delegation |
 
 ### Model lists

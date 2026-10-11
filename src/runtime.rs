@@ -283,6 +283,7 @@ impl OutputParser {
             OutputFormat::CodexJson => self.feed_codex(&v),
             OutputFormat::OpencodeJson => self.feed_opencode(&v),
             OutputFormat::PiJson => self.feed_pi(&v),
+            OutputFormat::CopilotJson => self.feed_copilot(&v),
             OutputFormat::Text => unreachable!(),
         }
     }
@@ -496,6 +497,71 @@ impl OutputParser {
         out
     }
 
+    /// GitHub Copilot CLI `--output-format json`: one session event per line (`{type, data, …}`,
+    /// see `session-events.schema.json` in `@github/copilot-sdk`). Streaming deltas are skipped.
+    /// Every top-level assistant message is part of the reply, so `<message>` blocks written
+    /// before a closing remark are not lost.
+    fn feed_copilot(&mut self, v: &Value) -> Vec<LogLine> {
+        let mut out = vec![];
+        let d = &v["data"];
+        let nested = d["parentToolCallId"].is_string(); // a subagent's events
+        match v["type"].as_str().unwrap_or_default() {
+            "session.start" => {
+                if let Some(id) = d["sessionId"].as_str() {
+                    self.native_session = Some(id.to_string());
+                }
+                out.push(LogLine::new(LogKind::Info, "session started"));
+            }
+            "assistant.message" if !nested => {
+                let t = d["content"].as_str().unwrap_or_default();
+                if !t.trim().is_empty() {
+                    out.push(LogLine::new(LogKind::Text, t));
+                    if !self.text.is_empty() {
+                        self.text.push_str("\n\n");
+                    }
+                    self.text.push_str(t);
+                    self.last_message = t.to_string();
+                }
+            }
+            "assistant.reasoning" if !nested => {
+                let t = d["content"].as_str().unwrap_or_default();
+                if !t.trim().is_empty() {
+                    out.push(LogLine::new(LogKind::Thinking, t));
+                }
+            }
+            "tool.execution_start" => {
+                let name = d["toolTitle"].as_str().or(d["toolName"].as_str()).unwrap_or("tool");
+                out.push(LogLine::new(LogKind::Tool, format!("{name} {}", summarize_json(&d["arguments"]))));
+            }
+            "tool.execution_complete" => {
+                let (kind, body) = if d["success"] == false {
+                    (LogKind::Error, d["error"]["message"].as_str().unwrap_or("tool failed"))
+                } else {
+                    (LogKind::ToolResult, d["result"]["content"].as_str().unwrap_or_default())
+                };
+                if !body.trim().is_empty() {
+                    out.push(LogLine::new(kind, truncate(body, 2000)));
+                }
+            }
+            "assistant.usage" => self.cost += d["cost"].as_f64().unwrap_or(0.0),
+            "model.call_failure" => out.push(LogLine::new(
+                LogKind::Info,
+                format!("model call failed ({}), retrying", d["errorMessage"].as_str().unwrap_or("provider error")),
+            )),
+            "session.warning" => out.push(LogLine::new(LogKind::Info, d["message"].as_str().unwrap_or_default())),
+            // e.g. errorType "rate_limit" / errorCode "user_weekly_rate_limited", or "quota".
+            "session.error" => {
+                let kind = [d["errorType"].as_str(), d["errorCode"].as_str()].into_iter().flatten().collect::<Vec<_>>();
+                let msg = d["message"].as_str().unwrap_or("copilot reported an error");
+                let msg = if kind.is_empty() { msg.to_string() } else { format!("{msg} [{}]", kind.join("/")) };
+                out.push(LogLine::new(LogKind::Error, msg.clone()));
+                self.error = Some(msg);
+            }
+            _ => {}
+        }
+        out
+    }
+
     fn feed_opencode(&mut self, v: &Value) -> Vec<LogLine> {
         let part = &v["part"];
         match v["type"].as_str().unwrap_or_default() {
@@ -609,6 +675,23 @@ mod tests {
         let (args, _) = build_args(&inv);
         assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
         assert!(!args.iter().any(|a| a.contains("dangerously")));
+        let p = persona("gpt-5.3-codex", Effort::Ultra);
+        let inv = Invocation {
+            spec: &rts["copilot"],
+            persona: &p,
+            prompt: "hi",
+            workdir: Path::new("/tmp"),
+            native_session: Some("0cb916db-26aa-40f2-86b5-1ba81b225fd2"),
+            resume: true,
+            wrapper: None,
+        };
+        let (args, prompt_in_args) = build_args(&inv);
+        assert!(!prompt_in_args, "the prompt goes to stdin");
+        assert!(args.windows(2).any(|w| w == ["--model", "gpt-5.3-codex"]));
+        assert!(args.windows(2).any(|w| w == ["--reasoning-effort", "max"]));
+        assert!(args.windows(2).any(|w| w == ["--session-id", "0cb916db-26aa-40f2-86b5-1ba81b225fd2"]));
+        assert!(args.contains(&"--deny-tool=shell(pkill)".to_string()));
+        assert!(args.contains(&"--no-ask-user".to_string()));
     }
 
     #[test]
@@ -697,6 +780,38 @@ mod tests {
         assert_eq!(out.text, "Done. <message to=\"lead\">result ready</message>");
         assert_eq!(out.native_session.as_deref(), Some("bc66e7da-dfaa-4677-852a-1535c50f75fe"));
         assert!(out.error.is_none());
+    }
+
+    /// Events follow the Copilot SDK's `session-events.schema.json` (hand-written sample).
+    #[test]
+    fn parses_copilot_json() {
+        let mut p = OutputParser::new(OutputFormat::CopilotJson);
+        let mut logs = vec![];
+        for l in include_str!("../testdata/copilot-json.jsonl").lines() {
+            logs.extend(p.feed(l));
+        }
+        let kinds: Vec<LogKind> = logs.iter().map(|l| l.kind).collect();
+        assert!(kinds.contains(&LogKind::Thinking));
+        assert!(logs.iter().any(|l| l.kind == LogKind::Tool && l.text.contains("cargo test")));
+        assert!(logs.iter().any(|l| l.kind == LogKind::ToolResult && l.text.contains("12 passed")));
+        assert!(logs.iter().any(|l| l.kind == LogKind::Error && l.text.contains("pkill")));
+        let out = p.finish();
+        assert!(out.error.is_none());
+        assert_eq!(out.native_session.as_deref(), Some("0cb916db-26aa-40f2-86b5-1ba81b225fd2"));
+        assert!(out.text.starts_with("I'll add the endpoint."));
+        assert!(!out.text.contains("subagent chatter"));
+        let d = crate::orchestrator::parse_directives(&out.text);
+        assert_eq!(d.messages, vec![("qa".to_string(), "POST /links is ready, tests pass.".to_string())]);
+    }
+
+    #[test]
+    fn copilot_limits_switch_to_fallbacks() {
+        let mut p = OutputParser::new(OutputFormat::CopilotJson);
+        p.feed(r#"{"type":"session.error","data":{"errorType":"rate_limit","errorCode":"user_weekly_rate_limited","message":"You've reached your weekly rate limit for gpt-5.4. Try again in 2 days 3 hours."}}"#);
+        let out = p.finish();
+        let spec = &crate::config::builtin_runtimes()["copilot"];
+        let reason = crate::limits::detect(spec, &out).expect("recognised as a limit");
+        assert!(reason.contains("user_weekly_rate_limited"));
     }
 
     #[test]

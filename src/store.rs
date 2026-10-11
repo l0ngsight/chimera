@@ -10,8 +10,12 @@ use crate::config::PromptLlmConfig;
 use crate::decisions::DecisionsConfig;
 use crate::model::Team;
 
-/// Teams shipped with chimera, written to the data dir on first start.
-const SAMPLE_TEAMS: &[(&str, &str)] = &[("software-dev", include_str!("../teams/software-dev.yaml"))];
+/// Teams shipped with chimera. Each is written to the data dir once (also on existing installs
+/// when a new sample ships); `.samples` remembers which were offered, so deleting one sticks.
+pub const SAMPLE_TEAMS: &[(&str, &str)] = &[
+    ("software-dev", include_str!("../teams/software-dev.yaml")),
+    ("scb-software-engineering", include_str!("../teams/scb-software-engineering.yaml")),
+];
 
 pub struct TeamStore {
     dir: PathBuf,
@@ -22,10 +26,26 @@ impl TeamStore {
         let fresh = !dir.exists();
         std::fs::create_dir_all(&dir)?;
         let store = Self { dir };
-        if fresh {
-            for (id, yaml) in SAMPLE_TEAMS {
+        let marker = store.dir.join(".samples");
+        let mut offered: Vec<String> = match std::fs::read_to_string(&marker) {
+            Ok(text) => text.lines().map(str::to_owned).collect(),
+            // Installs from before the marker existed were given the first sample team.
+            Err(_) if !fresh => vec!["software-dev".into()],
+            Err(_) => vec![],
+        };
+        let mut changed = false;
+        for (id, yaml) in SAMPLE_TEAMS {
+            if offered.iter().any(|o| o == id) {
+                continue;
+            }
+            if !store.path(id).exists() {
                 std::fs::write(store.path(id), yaml)?;
             }
+            offered.push(id.to_string());
+            changed = true;
+        }
+        if changed || !marker.exists() {
+            std::fs::write(&marker, offered.join("\n") + "\n")?;
         }
         Ok(store)
     }
@@ -162,5 +182,36 @@ mod tests {
             assert_eq!(&team.id, id);
             team.validate().unwrap_or_else(|e| panic!("{id}: {e}"));
         }
+    }
+
+    /// The SCB team may only use Copilot CLI and the bank's approved models.
+    #[test]
+    fn scb_team_uses_only_approved_copilot_models() {
+        const APPROVED: &[&str] =
+            &["claude-sonnet-5", "gpt-5-mini", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.6-luna"];
+        let (_, yaml) = super::SAMPLE_TEAMS.iter().find(|(id, _)| *id == "scb-software-engineering").unwrap();
+        let team: crate::model::Team = serde_yaml::from_str(yaml).unwrap();
+        for p in &team.personas {
+            for c in p.at_levels() {
+                assert_eq!(c.runtime, "copilot", "{}", p.id);
+                assert!(APPROVED.contains(&c.model.as_str()), "{}: {}", p.id, c.model);
+            }
+        }
+    }
+
+    #[test]
+    fn new_sample_teams_reach_existing_installs_once() {
+        let dir = std::env::temp_dir().join(format!("chimera-teams-{}", uuid::Uuid::new_v4()));
+        // An install from before `.samples` existed, whose user deleted the first sample.
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = super::TeamStore::open(dir.clone()).unwrap();
+        let ids: Vec<String> = store.list().unwrap().into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec!["scb-software-engineering"]);
+        // Deleting a sample sticks across restarts.
+        std::fs::remove_file(dir.join("scb-software-engineering.yaml")).unwrap();
+        assert!(super::TeamStore::open(dir.clone()).unwrap().list().unwrap().is_empty());
+        // A fresh install gets every sample.
+        let fresh = dir.join("fresh");
+        assert_eq!(super::TeamStore::open(fresh).unwrap().list().unwrap().len(), super::SAMPLE_TEAMS.len());
     }
 }

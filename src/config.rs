@@ -194,6 +194,8 @@ pub enum OutputFormat {
     OpencodeJson,
     /// `pi -p --mode json` (JSONL session events).
     PiJson,
+    /// `copilot --output-format json` (GitHub Copilot CLI session events, JSONL).
+    CopilotJson,
 }
 
 /// How to discover the models a runtime can use.
@@ -233,6 +235,8 @@ pub enum ModelsFormat {
     OpencodeVerbose,
     /// `pi --list-models` (table: provider, model, context, max-out, thinking, images).
     PiTable,
+    /// The `model` choices listed by `copilot help config`.
+    CopilotConfig,
 }
 
 fn one(s: &str) -> ArgItem {
@@ -248,6 +252,17 @@ fn group(items: &[&str]) -> ArgItem {
 /// `bypassPermissions`, including inside pipes and `&&` chains.
 pub const CLAUDE_DENIED_TOOLS: &str =
     "Bash(pkill *),Bash(killall *),Bash(kill *),Bash(xargs kill *),Bash(osascript *),Bash(shutdown *),Bash(reboot *)";
+
+/// The same protection for GitHub Copilot CLI agents (`--deny-tool` wins over `--allow-all-tools`).
+const COPILOT_DENIED_TOOLS: &[&str] = &[
+    "--deny-tool=shell(pkill)",
+    "--deny-tool=shell(killall)",
+    "--deny-tool=shell(kill)",
+    "--deny-tool=shell(xargs kill)",
+    "--deny-tool=shell(osascript)",
+    "--deny-tool=shell(shutdown)",
+    "--deny-tool=shell(reboot)",
+];
 
 /// Built-in runtime definitions. Users can override any of them in `chimera.yaml`.
 pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
@@ -392,6 +407,52 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             limit_patterns: default_limit_patterns(),
             models_source: ModelsSource::Static,
             models: vec!["anthropic/claude-opus-5-5".into(), "nousresearch/hermes-4-405b".into()],
+        },
+    );
+    m.insert(
+        "copilot".into(),
+        RuntimeSpec {
+            label: "GitHub Copilot CLI".into(),
+            kind: RuntimeKind::Process,
+            command: "copilot".into(),
+            // Prompt on stdin (non-interactive run). The same --session-id creates the session on
+            // the first turn and continues it afterwards.
+            args: [
+                vec![
+                    group(&["--model", "{model}"]),
+                    group(&["--reasoning-effort", "{effort}"]),
+                    group(&["--session-id", "{native_session}"]),
+                    one("--output-format"),
+                    one("json"),
+                    // Unattended: approve tool use, never stop to ask the user a question.
+                    one("--allow-all-tools"),
+                    one("--no-ask-user"),
+                    one("--no-auto-update"),
+                    one("--no-color"),
+                ],
+                COPILOT_DENIED_TOOLS.iter().map(|d| one(d)).collect(),
+            ]
+            .concat(),
+            resume_args: None,
+            session: SessionMode::Preassign,
+            output: OutputFormat::CopilotJson,
+            effort_map: BTreeMap::from([("ultra".into(), "max".into())]),
+            env: BTreeMap::new(),
+            timeout_secs: default_timeout(),
+            guard: true,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Command {
+                args: vec!["help".into(), "config".into()],
+                format: ModelsFormat::CopilotConfig,
+            },
+            models: vec![
+                "claude-sonnet-5".into(),
+                "gpt-5.6-luna".into(),
+                "gpt-5.4".into(),
+                "gpt-5.4-mini".into(),
+                "gpt-5.3-codex".into(),
+                "gpt-5-mini".into(),
+            ],
         },
     );
     m.insert(

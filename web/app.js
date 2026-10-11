@@ -334,7 +334,7 @@ function createGraph(wrap, team, opts = {}) {
 function ellipsize(s, n) { s = s || ''; return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
 function runtimeColor(rt) {
-  return { claude: '#d97757', codex: '#10a37f', opencode: '#a78bfa', hermes: '#f5c542', pi: '#38bdf8', mock: '#64748b' }[rt] || '#7c9cff';
+  return { claude: '#d97757', codex: '#10a37f', opencode: '#a78bfa', hermes: '#f5c542', pi: '#38bdf8', copilot: '#f472b6', mock: '#64748b' }[rt] || '#7c9cff';
 }
 
 // ---------------------------------------------------------------- sessions list
