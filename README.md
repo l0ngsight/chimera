@@ -305,6 +305,12 @@ data/
 Sessions survive restarts. A session that was running when the server stopped is marked **interrupted** and can
 be resumed by sending it a message.
 
+**Stopping.** Ctrl+C, `kill` (SIGTERM) or closing the terminal (SIGHUP) stops the agents, saves every session and
+exits, normally within a second. A second Ctrl+C exits immediately, and the process exits after 8 seconds
+whatever happens. Each agent runs in its own process group: a turn ends when the agent CLI exits, and anything it
+left running in the background (a dev server, a file watcher) is stopped with it, so leftovers neither keep a
+session "running" nor outlive Chimera. On Linux agents are also killed if Chimera itself is killed.
+
 ## HTTP API
 
 | Method & path | Purpose |

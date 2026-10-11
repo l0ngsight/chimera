@@ -77,11 +77,16 @@ async fn main() -> anyhow::Result<()> {
             let stopping = state.clone();
             axum::serve(listener, web::router(state))
                 .with_graceful_shutdown(async move {
-                    ctrl_c().await;
-                    force_exit_on_second_signal();
+                    let signal = stop_signal().await;
+                    tracing::info!("{signal}: stopping agents and saving sessions (Ctrl+C again to force)");
+                    force_exit_watchdog();
                     stopping.shutdown().await;
                 })
                 .await?;
+            tracing::info!("chimera stopped");
+            // Exit right away: nothing left to do, and dropping the runtime could wait on
+            // blocking work (DNS lookups, file I/O) that no longer matters.
+            std::process::exit(0);
         }
         Some(Command::Tui { url }) => {
             std::fs::create_dir_all(&cfg.data_dir)?;
@@ -102,17 +107,22 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move { axum::serve(listener, web::router(state)).await });
                 true
             };
-            tui::run(client, embedded).await?;
+            let result = tui::run(client, embedded).await;
             if let Some(state) = server {
                 // Stop agent processes and save sessions before the process exits.
+                force_exit_watchdog();
                 state.shutdown().await;
             }
             if embedded {
                 println!("Chimera stopped. Log: {}", log_path.display());
             }
+            if let Err(e) = result {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
     }
-    Ok(())
 }
 
 fn load_config(opts: &ServerOpts) -> anyhow::Result<Config> {
@@ -196,18 +206,46 @@ async fn build_state(cfg: &Config) -> anyhow::Result<Arc<AppState>> {
     }))
 }
 
-async fn ctrl_c() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutting down (press Ctrl+C again to force)");
+/// Waits for Ctrl+C, `kill` (SIGTERM) or the terminal closing (SIGHUP) and names it.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).ok();
+        let mut hup = signal(SignalKind::hangup()).ok();
+        async fn recv(s: Option<&mut tokio::signal::unix::Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "Ctrl+C",
+            _ = recv(term.as_mut()) => "SIGTERM",
+            _ = recv(hup.as_mut()) => "SIGHUP",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
+    }
 }
 
-/// After the first Ctrl+C: a second one, or 10 seconds without finishing, exits immediately.
-fn force_exit_on_second_signal() {
+/// Once shutdown starts, guarantees the process ends: a second Ctrl+C exits at once, and after
+/// 8 seconds it exits regardless. Runs on its own OS thread so it works even if the async
+/// runtime is stuck.
+fn force_exit_watchdog() {
     tokio::spawn(async {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::warn!("forced exit"),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => tracing::warn!("shutdown took too long; exiting"),
-        }
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("forced exit");
+        std::process::exit(130);
+    });
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        eprintln!("shutdown took too long; exiting");
         std::process::exit(130);
     });
 }

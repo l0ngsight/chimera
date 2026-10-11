@@ -1351,6 +1351,45 @@ mod e2e_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    /// An agent that leaves a process running in the background (holding its stdout) still
+    /// finishes its turn when it exits, and the leftover process is stopped.
+    #[tokio::test]
+    async fn background_processes_do_not_keep_a_turn_open() {
+        let pidfile = temp_dir().join("bg.pid");
+        let mut rts = builtin_runtimes();
+        let script = format!(
+            "cat > /dev/null; (trap '' INT TERM HUP; sleep 300) & echo $! > '{}'; printf '<final>started</final>'",
+            pidfile.display()
+        );
+        rts.insert(
+            "bg".into(),
+            RuntimeSpec {
+                label: "bg".into(),
+                command: "sh".into(),
+                args: vec![ArgItem::One("-c".into()), ArgItem::One(script)],
+                output: OutputFormat::Text,
+                ..rts["hermes"].clone()
+            },
+        );
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: bg}\n").unwrap();
+        let orch = orchestrator(rts); // the process guard is off in tests
+        let started = Instant::now();
+        let session = orch
+            .create_session(NewSession { team, task: "go".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert_eq!(session.lock().meta.final_answer.as_deref(), Some("started"));
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Killed processes may linger as zombies until init reaps them; those are not running.
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|st| st.rsplit(')').next().is_some_and(|rest| !rest.trim_start().starts_with('Z')));
+        assert!(!alive, "background process {pid} survived the turn");
+    }
+
     #[tokio::test]
     async fn cancel_stops_running_processes() {
         let mut rts = builtin_runtimes();

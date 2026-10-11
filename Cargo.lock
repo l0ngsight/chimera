@@ -313,6 +313,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

@@ -152,6 +152,7 @@ pub async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    own_process_group(&mut cmd);
     for var in guard.map(|b| b.hidden_env).unwrap_or_default() {
         cmd.env_remove(var);
     }
@@ -200,17 +201,23 @@ pub async fn run_process(
     let timeout = tokio::time::sleep(Duration::from_secs(spec.timeout_secs.max(1)));
     tokio::pin!(timeout);
 
+    let pgid = child.id();
     let mut aborted: Option<String> = None;
-    loop {
+    let mut status = None;
+    let mut stdout_open = true;
+    // The turn ends when the CLI exits. Processes it left running in the background (a dev
+    // server, a watcher) may keep stdout open forever, so we do not wait for end-of-file.
+    while status.is_none() {
         tokio::select! {
-            line = lines.next_line() => match line {
+            line = lines.next_line(), if stdout_open => match line {
                 Ok(Some(line)) => {
                     for l in parser.feed(&line) {
                         let _ = log.send(l);
                     }
                 }
-                _ => break,
+                _ => stdout_open = false,
             },
+            st = child.wait() => status = Some(st.ok()),
             _ = &mut timeout => {
                 aborted = Some(format!("timed out after {}s", spec.timeout_secs));
                 break;
@@ -223,13 +230,40 @@ pub async fn run_process(
             }
         }
     }
-
     if let Some(reason) = &aborted {
+        kill_process_group(pgid);
         let _ = child.start_kill();
         let _ = log.send(LogLine::new(LogKind::Error, format!("process {reason}")));
     }
-    let status = child.wait().await.ok();
-    let stderr_tail = stderr_task.await.unwrap_or_default();
+    // Read what the CLI wrote just before exiting. A process left in the background can keep
+    // the pipe open, so read briefly, stop the turn's whole process group (outside the process
+    // guard, which already does this), then read the rest (`next_line` is cancellation safe).
+    for (round, wait) in [Duration::from_secs(2), Duration::from_secs(2)].into_iter().enumerate() {
+        if round == 1 {
+            kill_process_group(pgid);
+        }
+        let until = tokio::time::Instant::now() + wait;
+        while stdout_open {
+            match tokio::time::timeout_at(until, lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    for l in parser.feed(&line) {
+                        let _ = log.send(l);
+                    }
+                }
+                Ok(_) => stdout_open = false,
+                Err(_) => break,
+            }
+        }
+    }
+    if stdout_open {
+        kill_process_group(pgid);
+    }
+    let status = match status {
+        Some(s) => s,
+        None => tokio::time::timeout(Duration::from_secs(5), child.wait()).await.ok().and_then(Result::ok),
+    };
+    let stderr_tail =
+        tokio::time::timeout(Duration::from_secs(2), stderr_task).await.ok().and_then(Result::ok).unwrap_or_default();
     let exit_code = status.and_then(|s| s.code());
 
     let mut out = parser.finish();
@@ -248,6 +282,39 @@ pub async fn run_process(
         out.error = Some(msg);
     }
     out
+}
+
+/// Starts the agent in a process group of its own, so the whole group can be stopped at the end
+/// of the turn and a Ctrl+C in Chimera's terminal reaches Chimera only (which then stops the
+/// agents itself). On Linux the agent is also killed if Chimera dies without cleaning up.
+fn own_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe and touches only the calling (child) process.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+/// Kills the process group led by the agent CLI (the agent and anything it left running).
+fn kill_process_group(pgid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid.and_then(|p| libc::pid_t::try_from(p).ok()).filter(|p| *p > 1) {
+        // SAFETY: plain syscall; a group that no longer exists just returns ESRCH.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
 }
 
 /// Incremental parser for a runtime's stdout.
