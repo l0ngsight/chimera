@@ -161,6 +161,7 @@ its outcome, confidence, latency and cost.
 | **Recipient repair** | `<message to="…">` names an id that is not on the team | Jev picks which allowed teammate was meant (or none). The message is re-addressed, but only along existing edges. |
 | **Missed `<final>`** | the entry persona replies without `<final>` and nothing else is pending | If Jev is confident the reply hands the finished result to the user, the session completes with it. Otherwise it goes idle as before. |
 | **Auto-routing** | you send a follow-up with recipient **⚡ Auto** | Jev picks the persona best suited to handle it, falling back to the entry persona. |
+| **Effort advice** (optional, off by default) | before every turn | Jev picks the reasoning effort the turn's messages need, between `low` and the persona's configured effort (one level above it with *allow raise*). A quick rename runs at `low`, a design review keeps `high`. Turn it on in **Settings → Quick decisions** (`advise_effort`, `effort_min_confidence`, `effort_can_raise` in `chimera.yaml`). |
 
 **Setup (OpenRouter, the default):** export your OpenRouter key as `JEV_API_KEY` (`OPENROUTER_API_KEY` also
 works) for the server, then press **Settings → Quick decisions → Test connection**. Requests go to

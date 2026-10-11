@@ -5,7 +5,8 @@
 //! - not waking a persona for pure acknowledgements,
 //! - repairing messages addressed to an unknown teammate id,
 //! - noticing when the entry persona finished but forgot `<final>`,
-//! - routing a user's follow-up message to the right persona.
+//! - routing a user's follow-up message to the right persona,
+//! - (optional) choosing the reasoning effort a turn needs.
 //!
 //! Every decision is optional: if Jev is disabled, unconfigured or fails, chimera falls back to its
 //! default behaviour.
@@ -17,7 +18,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::model::{Persona, Team};
+use crate::model::{Effort, Persona, Team};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,6 +45,12 @@ pub struct DecisionsConfig {
     /// Allow "auto" as the recipient of user messages.
     pub route_user_messages: bool,
     pub route_min_confidence: f64,
+    /// Before each turn, let Jev pick the effort the turn needs (off by default). The persona's
+    /// configured effort is the ceiling unless `effort_can_raise` is set.
+    pub advise_effort: bool,
+    pub effort_min_confidence: f64,
+    /// Allow one level above the configured effort for turns Jev judges harder than usual.
+    pub effort_can_raise: bool,
 }
 
 impl Default for DecisionsConfig {
@@ -62,6 +69,9 @@ impl Default for DecisionsConfig {
             final_threshold: 0.9,
             route_user_messages: true,
             route_min_confidence: 0.4,
+            advise_effort: false,
+            effort_min_confidence: 0.5,
+            effort_can_raise: false,
         }
     }
 }
@@ -343,10 +353,78 @@ impl Jev {
         self.choice(cfg, state, json!("Which team member should handle `user_message`?"), criteria).await
     }
 
+    /// Picks the reasoning effort a persona's next turn needs, among `candidates`.
+    pub async fn advise_effort(
+        &self,
+        cfg: &DecisionsConfig,
+        persona: &Persona,
+        task: &str,
+        incoming: &[crate::session::InboxMessage],
+        candidates: &[Effort],
+    ) -> anyhow::Result<Verdict<String>> {
+        let criteria = candidates.iter().map(|e| (e.as_str().to_string(), json!(effort_meaning(*e)))).collect();
+        let mut messages = String::new();
+        for m in incoming {
+            messages.push_str(&format!("From {}:\n{}\n\n", m.from, clip(m.content.trim(), 3000)));
+        }
+        let mut agent = json!({ "who": describe(persona), "usual_effort": persona.effort.as_str() });
+        if !persona.prompt.trim().is_empty() {
+            agent["expertise"] = json!(clip(persona.prompt.trim(), 600));
+        }
+        let state = json!({
+            "agent": agent,
+            "original_task": clip(task, 3000),
+            "new_messages": clip(&messages, 8000),
+        });
+        self.choice(
+            cfg,
+            state,
+            json!("How much reasoning effort does `agent` need for the work `new_messages` ask of it? Pick the lowest level that will still do the work well."),
+            criteria,
+        )
+        .await
+    }
+
     /// Minimal request to check that the configuration works.
     pub async fn ping(&self, cfg: &DecisionsConfig) -> anyhow::Result<Verdict<f64>> {
         self.noul(cfg, json!("Hello, can you hear me?"), json!("Is this a greeting or a check-in?"), None).await
     }
+}
+
+fn effort_meaning(e: Effort) -> &'static str {
+    match e {
+        Effort::Minimal => "Trivial: acknowledge, relay or answer from what is already known; no real reasoning.",
+        Effort::Low => "Simple and well defined: a small edit, a routine command, a straightforward answer or report.",
+        Effort::Medium => "Ordinary work: a feature or fix of moderate size that needs some planning and reasoning.",
+        Effort::High => "Hard: design decisions, tricky debugging, reviews for subtle bugs, many interacting parts.",
+        Effort::Xhigh => "Very hard: deep architecture, algorithmic or security work where mistakes are costly.",
+        Effort::Max | Effort::Ultra => {
+            "Exceptionally hard, open-ended problems that need the most thorough reasoning available."
+        }
+    }
+}
+
+/// Efforts the advisor may choose for a persona configured with `configured`: from `low` up to
+/// the configured level (one above it when raising is allowed, but never into `ultra` unless it
+/// is configured). `minimal` is offered only to personas configured with it.
+pub fn effort_candidates(configured: Effort, can_raise: bool) -> Vec<Effort> {
+    let mut top = configured;
+    if can_raise && configured < Effort::Max {
+        top = Effort::ALL[Effort::ALL.iter().position(|e| *e == configured).unwrap_or(0) + 1];
+    }
+    let bottom = if configured == Effort::Minimal { Effort::Minimal } else { Effort::Low };
+    Effort::ALL.into_iter().filter(|e| *e >= bottom && *e <= top).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn effort_candidates_are_capped() {
+    use Effort::*;
+    assert_eq!(effort_candidates(High, false), vec![Low, Medium, High]);
+    assert_eq!(effort_candidates(High, true), vec![Low, Medium, High, Xhigh]);
+    assert_eq!(effort_candidates(Low, false), vec![Low]);
+    assert_eq!(effort_candidates(Minimal, true), vec![Minimal, Low]);
+    assert_eq!(effort_candidates(Max, true), vec![Low, Medium, High, Xhigh, Max]);
 }
 
 fn describe(p: &Persona) -> String {

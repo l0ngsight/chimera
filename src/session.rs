@@ -145,6 +145,8 @@ pub enum DecisionKind {
     DetectFinal,
     /// Which persona should handle a user message?
     RouteUser,
+    /// How much reasoning effort does the next turn need?
+    AdviseEffort,
 }
 
 fn is_false(b: &bool) -> bool {

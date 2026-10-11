@@ -112,7 +112,7 @@ pub struct Position {
     pub y: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Minimal,
@@ -127,6 +127,14 @@ pub enum Effort {
 }
 
 impl Effort {
+    /// Every level, lowest first.
+    pub const ALL: [Effort; 7] =
+        [Effort::Minimal, Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max, Effort::Ultra];
+
+    pub fn parse(s: &str) -> Option<Effort> {
+        Effort::ALL.into_iter().find(|e| e.as_str() == s)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Effort::Minimal => "minimal",

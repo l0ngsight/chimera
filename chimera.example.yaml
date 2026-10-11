@@ -30,6 +30,11 @@ decisions:
   final_threshold: 0.9
   route_user_messages: true    # "Auto" recipient for user follow-ups
   route_min_confidence: 0.4
+  # Optional: let Jev pick each turn's reasoning effort (never above the persona's configured effort
+  # unless effort_can_raise allows one level more).
+  advise_effort: false
+  effort_min_confidence: 0.5
+  effort_can_raise: false
 
 # Runtime definitions. Argument templates support {model} {effort} {prompt} {workdir} {native_session}.
 # A nested list is a group that is dropped when any placeholder in it is empty.

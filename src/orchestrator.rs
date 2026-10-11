@@ -469,6 +469,10 @@ impl Orchestrator {
                 }
             });
             let process_spec = spec.clone().filter(|s| s.kind == RuntimeKind::Process);
+            let persona = match &process_spec {
+                Some(_) => orch.advise_effort(&session, persona, &task, &incoming).await,
+                None => persona,
+            };
             let output = match spec {
                 None => TurnOutput {
                     error: Some(format!("unknown runtime '{runtime_name}' (check chimera.yaml)")),
@@ -505,6 +509,41 @@ impl Orchestrator {
             let routed = orch.route_output(&session, &team, &persona, &output).await;
             complete_turn(&session, &persona, turn, incoming, output, routed, elapsed);
         });
+    }
+
+    /// Lets Jev lower (or, if allowed, raise) the effort of this turn; returns the persona to run.
+    async fn advise_effort(
+        &self,
+        session: &Session,
+        mut persona: Persona,
+        task: &str,
+        incoming: &[InboxMessage],
+    ) -> Persona {
+        let cfg = self.decisions_cfg();
+        if !cfg.active() || !cfg.advise_effort {
+            return persona;
+        }
+        let candidates = crate::decisions::effort_candidates(persona.effort, cfg.effort_can_raise);
+        if candidates.len() < 2 {
+            return persona;
+        }
+        let res = self.jev.advise_effort(&cfg, &persona, task, incoming, &candidates).await;
+        let chosen = match &res {
+            Ok(v) if v.confidence >= cfg.effort_min_confidence => {
+                crate::model::Effort::parse(&v.value).filter(|e| candidates.contains(e))
+            }
+            _ => None,
+        };
+        let configured = persona.effort;
+        let applied = chosen.is_some_and(|e| e != configured);
+        let subject = format!("effort for {}'s turn", persona.id);
+        record(session, Some(&persona.id), DecisionKind::AdviseEffort, subject, &res, applied, |v| {
+            format!("{} → {v}", configured.as_str())
+        });
+        if let Some(e) = chosen {
+            persona.effort = e;
+        }
+        persona
     }
 
     /// A turn failed on a usage/rate limit: remembers the limit and, if the persona has a
@@ -1346,6 +1385,10 @@ mod e2e_tests {
             let q = &req["questions"]["q"];
             let answer = match q["type"].as_str().unwrap() {
                 "noul" => json!({"type": "noul", "noul": 0.97}),
+                _ if q["criteria"].get("low").is_some() => {
+                    assert_eq!(req["state"]["agent"]["usual_effort"], "high");
+                    json!({"type": "choice", "choice": "low", "probabilities": {}, "confidence": 0.9})
+                }
                 _ if q["criteria"].get("none").is_some() => {
                     json!({"type": "choice", "choice": "worker", "probabilities": {}, "confidence": 0.9})
                 }
@@ -1590,6 +1633,57 @@ mod e2e_tests {
         assert_eq!(inner.meta.final_answer.as_deref(), Some("primary big"));
         assert_eq!(inner.meta.agents["a"].fallback, 0);
         assert!(inner.events.iter().any(|e| matches!(&e.body, EventBody::Fallback { level: 0, .. })));
+    }
+
+    /// With the effort advisor on, Jev's pick replaces the configured effort for the turn.
+    #[tokio::test]
+    async fn jev_advises_the_effort_of_a_turn() {
+        let mut rts = builtin_runtimes();
+        rts.insert(
+            "sh".into(),
+            RuntimeSpec {
+                label: "sh".into(),
+                command: "sh".into(),
+                args: vec![
+                    ArgItem::One("-c".into()),
+                    ArgItem::One("cat > /dev/null; printf '<final>effort=%s</final>' \"$0\"".into()),
+                    ArgItem::Group(vec!["{effort}".into()]),
+                ],
+                output: OutputFormat::Text,
+                ..rts["hermes"].clone()
+            },
+        );
+        let team: Team = serde_yaml::from_str(
+            "id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: sh, effort: high}\n",
+        )
+        .unwrap();
+        // SAFETY: test-only variable with a unique name, not read by other tests.
+        unsafe { std::env::set_var("CHIMERA_TEST_JEV_KEY3", "test-jev-key") };
+        let base = DecisionsConfig {
+            base_url: fake_jev().await,
+            api_key_env: "CHIMERA_TEST_JEV_KEY3".into(),
+            detect_final: false,
+            ..Default::default()
+        };
+        for (advise, expected) in [(false, "effort=high"), (true, "effort=low")] {
+            let orch = orchestrator_with(rts.clone(), DecisionsConfig { advise_effort: advise, ..base.clone() });
+            let session = orch
+                .create_session(NewSession {
+                    team: team.clone(),
+                    task: "rename a variable".into(),
+                    title: None,
+                    workdir: None,
+                    dry_run: false,
+                })
+                .unwrap();
+            assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+            let inner = session.lock();
+            assert_eq!(inner.meta.final_answer.as_deref(), Some(expected));
+            let advised = inner.events.iter().any(|e| {
+                matches!(&e.body, EventBody::Decision { kind: DecisionKind::AdviseEffort, applied: true, outcome, .. } if outcome == "high → low")
+            });
+            assert_eq!(advised, advise);
+        }
     }
 
     #[tokio::test]

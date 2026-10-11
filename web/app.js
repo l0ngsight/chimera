@@ -552,13 +552,14 @@ async function sessionPage(id) {
   }
 
   function renderDecision(e) {
-    const label = { ack_filter: 'ack filter', resolve_recipient: 'recipient', detect_final: 'completion', route_user: 'routing' }[e.kind] || e.kind;
+    const label = { ack_filter: 'ack filter', resolve_recipient: 'recipient', detect_final: 'completion', route_user: 'routing', advise_effort: 'effort' }[e.kind] || e.kind;
     const outcome = e.kind === 'route_user' || e.kind === 'resolve_recipient' ? personaName(e.outcome) : e.outcome;
     const effect = !e.applied ? '' : {
       ack_filter: ' → delivered without waking',
       resolve_recipient: ' → message re-addressed',
       detect_final: ' → session completed',
       route_user: ' → message sent there',
+      advise_effort: ' → used for this turn',
     }[e.kind] || '';
     return h('div', { class: 'decision' + (e.error ? ' failed' : e.applied ? ' applied' : '') },
       h('span', { class: 'jev' }, '⚡ Jev'), ' ', h('b', {}, label), ' · ', e.subject, ': ',
@@ -1164,6 +1165,9 @@ function jevCard(settings) {
     final_threshold: num(d.final_threshold),
     route_user_messages: h('input', { type: 'checkbox', checked: d.route_user_messages }),
     route_min_confidence: num(d.route_min_confidence),
+    advise_effort: h('input', { type: 'checkbox', checked: d.advise_effort }),
+    effort_min_confidence: num(d.effort_min_confidence),
+    effort_can_raise: h('input', { type: 'checkbox', checked: d.effort_can_raise }),
   };
   const status = h('div', { class: 'small' });
   const showStatus = s => {
@@ -1212,7 +1216,9 @@ function jevCard(settings) {
       toggle(f.ack_filter, 'Don’t wake a persona for pure acknowledgements (“thanks”, “sounds good”); they are read on its next turn', f.ack_min_confidence, 'min confidence'),
       toggle(f.resolve_recipients, 'Re-address messages sent to an unknown teammate id (e.g. “backend_engineer” → backend)', f.resolve_min_confidence, 'min confidence'),
       toggle(f.detect_final, 'Complete the session when the entry persona reports the task done but forgets <final>', f.final_threshold, 'min probability'),
-      toggle(f.route_user_messages, 'Offer “Auto” as recipient of your follow-up messages', f.route_min_confidence, 'min confidence')),
+      toggle(f.route_user_messages, 'Offer “Auto” as recipient of your follow-up messages', f.route_min_confidence, 'min confidence'),
+      toggle(f.advise_effort, 'Advise effort: before each turn, pick the reasoning effort the work needs (never above the persona’s configured effort), e.g. low for a quick fix, high for a design review', f.effort_min_confidence, 'min confidence'),
+      h('label', { class: 'inline small', style: 'margin:-2px 0 8px 26px' }, f.effort_can_raise, 'Allow one level above the configured effort for unusually hard turns (check that the model supports it)')),
     h('div', { class: 'row', style: 'margin-top:14px' }, testOut, h('span', { class: 'spacer' }),
       h('button', { onclick: test }, 'Test connection'), h('button', { class: 'primary', onclick: save }, 'Save')));
 }
