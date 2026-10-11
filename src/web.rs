@@ -32,6 +32,24 @@ pub struct AppState {
     pub orchestrator: Arc<Orchestrator>,
     pub catalog: crate::catalog::Catalog,
     pub sessions: RwLock<BTreeMap<String, Arc<Session>>>,
+    /// Flips to true when the server shuts down; ends open event streams.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl AppState {
+    /// Stops the server's work: closes event streams and interrupts running sessions (their
+    /// agent processes are stopped; a message resumes them after a restart). Waits up to 5 s.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
+        let sessions: Vec<Arc<Session>> = self.sessions.read().unwrap().values().cloned().collect();
+        for s in &sessions {
+            self.orchestrator.interrupt(s);
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sessions.iter().any(|s| s.lock().scheduler_active) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }
 
 type AppResult<T> = Result<T, ApiError>;
@@ -375,6 +393,11 @@ async fn session_stream(
     let live = BroadcastStream::new(rx).filter_map(move |r| r.ok().filter(|e| e.seq > last_seq));
     let stream =
         replay.chain(live).map(|e| Ok(SseEvent::default().data(serde_json::to_string(&e).unwrap_or_default())));
+    // End the stream when the server shuts down, otherwise graceful shutdown waits on it forever.
+    let mut stop = st.shutdown.subscribe();
+    let stream = futures::StreamExt::take_until(stream, async move {
+        let _ = stop.wait_for(|down| *down).await;
+    });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 

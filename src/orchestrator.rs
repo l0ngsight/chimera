@@ -312,6 +312,18 @@ impl Orchestrator {
         changes
     }
 
+    /// Stops a running session because the server is shutting down; it can be resumed later.
+    pub fn interrupt(&self, session: &Arc<Session>) {
+        let mut inner = session.lock();
+        if !inner.scheduler_active {
+            return;
+        }
+        inner.stopping = Some((SessionStatus::Interrupted, Some("server stopped; send a message to continue".into())));
+        let _ = inner.cancel.send(true);
+        drop(inner);
+        session.wake.notify_one();
+    }
+
     pub fn cancel(&self, session: &Arc<Session>) {
         let mut inner = session.lock();
         if !inner.scheduler_active {
