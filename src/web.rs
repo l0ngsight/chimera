@@ -171,17 +171,40 @@ async fn create_team(State(st): State<Arc<AppState>>, Json(team): Json<Team>) ->
     Ok(Json(team))
 }
 
+#[derive(Deserialize)]
+struct UpdateTeamQuery {
+    /// Also apply the edit to existing sessions of this team (from each persona's next turn).
+    #[serde(default = "yes")]
+    apply_to_sessions: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
 async fn update_team(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(q): Query<UpdateTeamQuery>,
     Json(team): Json<Team>,
-) -> AppResult<Json<Team>> {
+) -> AppResult<Json<serde_json::Value>> {
     if team.id != id {
         return Err(ApiError::bad("team id in body does not match the URL"));
     }
     team.validate().map_err(ApiError::bad)?;
     st.teams.save(&team)?;
-    Ok(Json(team))
+    let mut updated = 0;
+    if q.apply_to_sessions {
+        let sessions: Vec<Arc<Session>> = st.sessions.read().unwrap().values().cloned().collect();
+        for s in sessions.iter().filter(|s| s.lock().meta.team.id == id) {
+            if !st.orchestrator.apply_team(s, &team).is_empty() {
+                updated += 1;
+            }
+        }
+    }
+    let mut body = serde_json::to_value(&team).map_err(anyhow::Error::from)?;
+    body["sessions_updated"] = json!(updated);
+    Ok(Json(body))
 }
 
 async fn delete_team(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> AppResult<StatusCode> {

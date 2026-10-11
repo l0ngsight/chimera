@@ -319,10 +319,13 @@ fn log_lines<'a>(v: &'a SessionView, who: Option<&str>) -> Vec<Line<'a>> {
                 EventBody::Message { .. }
                 | EventBody::Final { .. }
                 | EventBody::SessionStatus { .. }
-                | EventBody::Decision { .. },
+                | EventBody::Decision { .. }
+                | EventBody::TeamUpdated { .. },
             ) => true,
             (None, _) => false,
             (Some(a), EventBody::Message { from, to, .. }) => from == a || to == a,
+            // Show team edits in a persona's log when they concern that persona.
+            (Some(a), EventBody::TeamUpdated { changes }) => changes.iter().any(|c| c.starts_with(a)),
             (Some(_), EventBody::AgentStatus { .. }) => false,
             (Some(a), _) => ev.agent.as_deref() == Some(a),
         };
@@ -437,6 +440,12 @@ fn event_lines<'a>(v: &'a SessionView, who: Option<&str>, ev: &'a Event, out: &m
             LogKind::Info => out.push(Line::from(text.to_string()).fg(Color::Cyan)),
             LogKind::Error => out.push(Line::from(format!("✖ {text}")).fg(Color::Red)),
         },
+        EventBody::TeamUpdated { changes } => {
+            out.push(Line::from(format!("✎ team updated · {}", time(ev))).fg(ACCENT));
+            for c in changes.iter().filter(|c| who.is_none_or(|a| c.starts_with(a))) {
+                out.push(Line::from(format!("   {c}")).fg(MUTED));
+            }
+        }
         EventBody::AgentStatus { .. } => {}
     }
 }

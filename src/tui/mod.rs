@@ -30,6 +30,8 @@ enum Msg {
     Teams(Vec<Team>),
     Settings(SettingsInfo),
     Opened(Box<SessionDetail>),
+    /// The open session's team was edited.
+    TeamRefreshed(String, Box<Team>),
     Created(String),
     Event(String, Box<Event>),
     Notice(String),
@@ -280,8 +282,24 @@ impl App {
                 self.open_session(id);
             }
             Msg::Event(id, ev) => {
+                let team_changed = matches!(ev.body, EventBody::TeamUpdated { .. });
                 if let Some(v) = self.view.as_mut().filter(|v| v.id == id) {
                     v.apply(*ev);
+                    if team_changed {
+                        let c = self.client.clone();
+                        self.spawn(async move {
+                            match c.session(&id).await {
+                                Ok(d) => Msg::TeamRefreshed(id, Box::new(d.team)),
+                                Err(e) => Msg::Error(format!("{e:#}")),
+                            }
+                        });
+                    }
+                }
+            }
+            Msg::TeamRefreshed(id, team) => {
+                if let Some(v) = self.view.as_mut().filter(|v| v.id == id) {
+                    v.team = *team;
+                    v.selected = v.selected.min(v.team.personas.len());
                 }
             }
             Msg::Notice(t) => self.notify(t, false),

@@ -407,7 +407,7 @@ async function sessionsPage() {
 
 async function sessionPage(id) {
   const [data, settings] = await Promise.all([api('GET', '/api/sessions/' + id), api('GET', '/api/settings').catch(() => ({}))]);
-  const team = data.team;
+  let team = data.team;
   const jevRouting = settings.decisions_active && settings.decisions.route_user_messages && !data.summary.dry_run;
   let summary = data.summary;
   const events = [];
@@ -501,7 +501,8 @@ async function sessionPage(id) {
   }
 
   function matches(e) {
-    if (!selected) return ['message', 'final', 'session_status', 'decision'].includes(e.type);
+    if (!selected) return ['message', 'final', 'session_status', 'decision', 'team_updated'].includes(e.type);
+    if (e.type === 'team_updated') return e.changes.some(c => c.startsWith(selected));
     if (e.type === 'message') return e.from === selected || e.to === selected;
     return e.agent === selected && e.type !== 'agent_status';
   }
@@ -521,6 +522,9 @@ async function sessionPage(id) {
       }
       case 'final':
         return h('div', { class: 'msg final' }, h('div', { class: 'msg-head' }, '✔ Final answer from ', h('b', {}, personaName(e.agent))), h('div', { class: 'msg-body' }, e.content));
+      case 'team_updated':
+        return h('div', { class: 'status-line team-updated' }, `✎ team updated · ${fmtTime(e.ts)}`,
+          h('ul', {}, e.changes.filter(c => !selected || c.startsWith(selected)).map(c => h('li', {}, c))));
       case 'session_status':
         return h('div', { class: 'status-line' }, `session ${e.status}${e.detail ? ' — ' + e.detail : ''} · ${fmtTime(e.ts)}`);
       case 'turn_start':
@@ -568,6 +572,10 @@ async function sessionPage(id) {
     if (e.type === 'agent_status') { agentStatus[e.agent] = e.status; graph.setStatus(e.agent, e.status); }
     if (e.type === 'session_status') { summary.status = e.status; summary.status_detail = e.detail; updateHeader(); }
     if (e.type === 'turn_start') { summary.total_turns = Math.max(summary.total_turns, e.turn); updateHeader(); }
+    // The team was edited: reload it so the graph shows the new models.
+    if (e.type === 'team_updated' && live) {
+      api('GET', '/api/sessions/' + id).then(d => { team = d.team; graph.setTeam(team); }).catch(() => {});
+    }
     if (e.type === 'message' && live && !e.rejected) graph.flash(e.from, e.to);
     if (live && matches(e) && tab !== 'persona') {
       if (body.querySelector('.empty')) rerender = true;
@@ -786,6 +794,7 @@ async function teamEditorPage(teamId) {
   let connectMode = false;
   let bidiDefault = true;
   const dirtyEl = h('span', { class: 'dirty' });
+  const applyBox = h('input', { type: 'checkbox', checked: true });
   const setDirty = d => { window.__dirty = d; dirtyEl.textContent = d ? '● unsaved changes' : ''; };
   setDirty(isNew);
   onLeave(() => setDirty(false));
@@ -861,9 +870,10 @@ async function teamEditorPage(teamId) {
     team.personas.forEach(p => { if (pos[p.id]) p.position = { x: Math.round(pos[p.id].x), y: Math.round(pos[p.id].y) }; });
     try {
       if (isNew) await api('POST', '/api/teams', team);
-      else await api('PUT', '/api/teams/' + team.id, team);
+      let updated = 0;
+      if (!isNew) updated = (await api('PUT', `/api/teams/${team.id}?apply_to_sessions=${applyBox.checked}`, team)).sessions_updated || 0;
       setDirty(false);
-      toast('Team saved');
+      toast(updated ? `Team saved · applied to ${updated} session${updated > 1 ? 's' : ''} (from each agent's next turn)` : 'Team saved');
       if (isNew) location.hash = '#/team/' + team.id;
     } catch (e) { toast(e.message, true); }
   }
@@ -1012,6 +1022,7 @@ async function teamEditorPage(teamId) {
         h('div', { class: 'row' }, h('a', { href: '#/teams' }, '← Teams'), h('h1', { style: 'margin:0 0 0 8px' }, isNew ? 'New team' : team.name), dirtyEl,
           h('span', { class: 'spacer' }),
           isNew ? null : h('a', { class: 'btn', href: '#/?team=' + team.id }, 'Start session'),
+          isNew ? null : h('label', { class: 'inline small', title: 'Changes take effect from each agent\'s next turn; a turn already running finishes on the old settings.' }, applyBox, 'apply to existing sessions'),
           h('button', { class: 'primary', onclick: save }, 'Save team')),
         h('div', { class: 'card' },
           h('div', { class: 'team-meta' },

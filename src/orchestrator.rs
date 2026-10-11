@@ -109,6 +109,7 @@ impl Orchestrator {
             total_turns: 0,
             final_answer: None,
             agents,
+            retired: Default::default(),
         };
         let session = Session::create(self.sessions_dir.join(&id), meta)?;
         let entry = session.lock().meta.team.entry.clone();
@@ -270,6 +271,47 @@ impl Orchestrator {
         routed
     }
 
+    /// Applies an edited team definition to a session. Takes effect from each persona's next
+    /// turn; personas removed from the team stay in the session so its history and inboxes remain
+    /// valid. Returns the human-readable changes (empty when nothing changed).
+    pub fn apply_team(&self, session: &Arc<Session>, team: &Team) -> Vec<String> {
+        let mut inner = session.lock();
+        let old = inner.meta.team.clone();
+        let mut merged = team.clone();
+        for p in &old.personas {
+            if merged.persona(&p.id).is_none() {
+                merged.personas.push(p.clone());
+            }
+        }
+        let retired = &inner.meta.retired;
+        let changes = team_changes(&old, &merged, team, retired);
+        if changes.is_empty() {
+            return changes;
+        }
+        let now_retired =
+            merged.personas.iter().filter(|p| team.persona(&p.id).is_none()).map(|p| p.id.clone()).collect();
+        inner.meta.retired = now_retired;
+        for p in &merged.personas {
+            let agent = inner.meta.agents.entry(p.id.clone()).or_insert_with(|| AgentState {
+                status: AgentStatus::Idle,
+                turns: 0,
+                native_session: None,
+                history: vec![],
+                notes: vec![],
+                inbox: vec![],
+            });
+            // A native CLI session cannot move to another CLI; the next turn starts a fresh one
+            // and the persona's history is replayed in its prompt instead.
+            if old.persona(&p.id).is_some_and(|o| o.runtime != p.runtime) {
+                agent.native_session = None;
+            }
+        }
+        inner.meta.team = merged;
+        session.emit_locked(&mut inner, None, EventBody::TeamUpdated { changes: changes.clone() });
+        inner.save(&session.dir);
+        changes
+    }
+
     pub fn cancel(&self, session: &Arc<Session>) {
         let mut inner = session.lock();
         if !inner.scheduler_active {
@@ -413,6 +455,66 @@ impl Orchestrator {
             complete_turn(&session, &persona, turn, incoming, output, routed, elapsed);
         });
     }
+}
+
+/// What changed between a session's team and an edited one, for the session timeline.
+fn team_changes(old: &Team, merged: &Team, edited: &Team, retired: &std::collections::BTreeSet<String>) -> Vec<String> {
+    let mut out = vec![];
+    for p in &merged.personas {
+        let Some(o) = old.persona(&p.id) else {
+            out.push(format!("{} joined the team ({} {})", p.id, p.runtime, p.model));
+            continue;
+        };
+        let id = &p.id;
+        if o.runtime != p.runtime {
+            out.push(format!("{id}: runtime {} → {} (starts a new CLI session)", o.runtime, p.runtime));
+        }
+        if o.model != p.model {
+            out.push(format!("{id}: model {} → {}", or_default(&o.model), or_default(&p.model)));
+        }
+        if o.effort != p.effort {
+            out.push(format!("{id}: effort {} → {}", o.effort.as_str(), p.effort.as_str()));
+        }
+        if o.prompt != p.prompt {
+            out.push(format!("{id}: prompt updated"));
+        }
+        if o.name != p.name || o.role != p.role {
+            out.push(format!("{id}: renamed to {} ({})", p.name, p.role));
+        }
+        if o.extra_args != p.extra_args || o.env != p.env {
+            out.push(format!("{id}: CLI arguments or environment updated"));
+        }
+    }
+    for p in &old.personas {
+        let removed = edited.persona(&p.id).is_none();
+        if removed && !retired.contains(&p.id) {
+            out.push(format!("{} was removed from the team (kept in this session)", p.id));
+        } else if !removed && retired.contains(&p.id) {
+            out.push(format!("{} rejoined the team", p.id));
+        }
+    }
+    let edges = |t: &Team| {
+        let mut e: Vec<String> = t.edges.iter().map(|e| format!("{}>{}:{}", e.from, e.to, e.bidirectional)).collect();
+        e.sort();
+        e
+    };
+    if edges(old) != edges(merged) {
+        out.push("communication channels changed".into());
+    }
+    if old.entry != merged.entry {
+        out.push(format!("entry persona {} → {}", old.entry, merged.entry));
+    }
+    if old.max_turns != merged.max_turns || old.max_parallel != merged.max_parallel {
+        out.push(format!("limits: {} turns, {} in parallel", merged.max_turns, merged.max_parallel));
+    }
+    if old.name != merged.name || old.description != merged.description {
+        out.push("team name or description updated".into());
+    }
+    out
+}
+
+fn or_default(model: &str) -> &str {
+    if model.is_empty() { "(runtime default)" } else { model }
 }
 
 /// Records a finished turn and routes the messages it produced.
@@ -960,6 +1062,7 @@ mod tests {
             round_turns: 0,
             total_turns: 0,
             final_answer: None,
+            retired: Default::default(),
         };
         let msg = [InboxMessage { from: USER.into(), content: "go".into(), wake: true }];
         for resume in [false, true] {
@@ -1235,6 +1338,68 @@ mod e2e_tests {
 
         // "auto" routing of a follow-up picks the persona Jev chose.
         assert_eq!(orch.route_user_message(&session, "one more thing").await, "worker");
+    }
+
+    /// Editing the team applies to an existing session from the next turn.
+    #[tokio::test]
+    async fn team_edits_apply_to_existing_sessions() {
+        let mut rts = builtin_runtimes();
+        let base = rts["hermes"].clone();
+        // Reports the model it was launched with: `sh -c SCRIPT MODEL` makes $0 the model.
+        let echo_model = |label: &str| RuntimeSpec {
+            label: label.into(),
+            command: "sh".into(),
+            args: vec![
+                ArgItem::One("-c".into()),
+                ArgItem::One("cat > /dev/null; printf '<final>model=%s</final>' \"$0\"".into()),
+                ArgItem::Group(vec!["{model}".into()]),
+            ],
+            output: OutputFormat::Text,
+            ..base.clone()
+        };
+        rts.insert("sh".into(), echo_model("sh"));
+        rts.insert("sh2".into(), echo_model("sh2"));
+        let team: Team = serde_yaml::from_str(
+            "id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: sh, model: m1}\n  - {id: b, name: B, runtime: sh, model: x}\n",
+        )
+        .unwrap();
+        let orch = orchestrator(rts);
+        let session = orch
+            .create_session(NewSession {
+                team: team.clone(),
+                task: "go".into(),
+                title: None,
+                workdir: None,
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        assert_eq!(session.lock().meta.final_answer.as_deref(), Some("model=m1"));
+
+        // Change a's model and runtime, remove b, add c.
+        session.lock().meta.agents.get_mut("a").unwrap().native_session = Some("old-cli-session".into());
+        let edited: Team = serde_yaml::from_str(
+            "id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: sh2, model: m2}\n  - {id: c, name: C, runtime: sh, model: y}\n",
+        )
+        .unwrap();
+        let changes = orch.apply_team(&session, &edited);
+        assert!(changes.contains(&"a: model m1 → m2".to_string()), "{changes:?}");
+        assert!(changes.iter().any(|c| c.starts_with("a: runtime sh → sh2")), "{changes:?}");
+        assert!(changes.iter().any(|c| c.starts_with("c joined")), "{changes:?}");
+        assert!(changes.iter().any(|c| c.starts_with("b was removed")), "{changes:?}");
+        {
+            let inner = session.lock();
+            assert!(inner.meta.agents["a"].native_session.is_none(), "runtime change resets the CLI session");
+            assert!(inner.meta.agents.contains_key("c"));
+            assert!(inner.meta.team.persona("b").is_some(), "removed personas stay in the session");
+            assert!(inner.events.iter().any(|e| matches!(e.body, EventBody::TeamUpdated { .. })));
+        }
+        // Applying the same team again is a no-op.
+        assert!(orch.apply_team(&session, &edited).is_empty());
+
+        orch.post_message(&session, "a", "again").unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        assert_eq!(session.lock().meta.final_answer.as_deref(), Some("model=m2"));
     }
 
     #[tokio::test]

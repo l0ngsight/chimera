@@ -665,6 +665,7 @@ mod tests {
         let (args, in_args) = build_args(&inv);
         assert!(in_args);
         assert!(args.contains(&"do it".to_string()));
+        assert!(args.contains(&"--auto".to_string()), "opencode must not auto-reject permissions");
         assert!(describe_command("opencode", &args, "do it").contains("<prompt>"));
     }
 

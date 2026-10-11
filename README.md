@@ -107,6 +107,12 @@ in the editor to whatever your CLIs accept.
 `--resume` on later ones). For other runtimes Chimera replays the persona's earlier turns in the prompt,
 within a size budget. Codex can be switched to native resume as well (see `chimera.example.yaml`).
 
+**Editing a running team.** Saving a team in the editor also applies the change to existing sessions of that
+team, from each persona's next turn (a turn already running finishes on the old settings). Each change appears in
+the session timeline, e.g. "qa: model x → y". A persona that changes CLI starts a fresh CLI session and receives its
+earlier conversation in the prompt; personas removed from the team stay in the session so its history remains
+valid. Untick **apply to existing sessions** next to **Save team** to change only new sessions.
+
 **Workspace.** By default each session gets `data/workspaces/<session-id>`. You can also point a session at an
 existing repository. All personas of a session share this directory.
 
@@ -174,7 +180,7 @@ Built-in defaults:
 |---|---|---|
 | `claude` | `claude -p --model M --effort E --output-format stream-json --verbose --permission-mode bypassPermissions --no-chrome --disallowedTools …` (prompt on stdin) | text, thinking, tool calls/results, cost |
 | `codex` | `codex exec --model M -c model_reasoning_effort="E" --json --sandbox workspace-write --skip-git-repo-check -` (network on, approvals never) | agent messages, reasoning, commands, file changes |
-| `opencode` | `opencode run --model M --variant E --format json "<prompt>"` | text, reasoning, tool use |
+| `opencode` | `opencode run --auto --model M --variant E --format json "<prompt>"` (`--auto` approves permission requests that are not explicitly denied; without it opencode auto-rejects them, e.g. access to `/tmp`) | text, reasoning, tool use |
 | `hermes` | `hermes chat --model M -q "<prompt>"` | plain text |
 | `pi` | `pi -p --mode json --model M --thinking E --session-id S` (prompt on stdin; the same `--session-id` continues the session) | text, thinking, tool calls/results, cost, errors and retries |
 | `mock` | built in | simulated delegation |
@@ -214,6 +220,7 @@ you may be using at the same time. Chimera layers these guardrails:
 | `pkill`, `killall`, `kill`, `… \| xargs kill`, `osascript`, `shutdown`, `reboot` are denied (also inside pipes and `&&` chains) | Claude | `--disallowedTools` (holds even with `bypassPermissions`) |
 | No access to your real Chrome through Claude in Chrome | Claude | `--no-chrome` |
 | Shell commands run in Codex's sandbox: writes confined to the workspace, network allowed, signals only within the sandbox | Codex | `--sandbox workspace-write` (macOS sandboxes can't be nested, so Codex uses its own instead of the process guard) |
+| opencode approves its own permission requests (it can work outside the workspace, e.g. in `/tmp`) unless a rule denies them. To limit it, remove `--auto` from the opencode runtime in `chimera.yaml` and allow only what you want per persona, e.g. env `OPENCODE_CONFIG_CONTENT={"permission":{"external_directory":{"/tmp/**":"allow"}}}` | opencode | `--auto` |
 
 The process guard is on by default and needs no configuration. On Linux it needs bubblewrap
 (`sudo apt install bubblewrap` / `sudo dnf install bubblewrap`) or unprivileged user namespaces for `unshare`. If

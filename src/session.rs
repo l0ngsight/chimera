@@ -116,6 +116,10 @@ pub enum EventBody {
     Final {
         content: String,
     },
+    /// The team was edited and the changes were applied to this session (from the next turn).
+    TeamUpdated {
+        changes: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +201,9 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_answer: Option<String>,
     pub agents: BTreeMap<String, AgentState>,
+    /// Personas removed from the team after the session started; kept so history stays valid.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub retired: std::collections::BTreeSet<String>,
 }
 
 /// Compact view for listings and the UI.

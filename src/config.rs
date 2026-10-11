@@ -318,6 +318,9 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             command: "opencode".into(),
             args: vec![
                 one("run"),
+                // Unattended: without --auto, opencode auto-rejects every "ask" permission (e.g.
+                // `external_directory` for /tmp) and the agent gets stuck. Explicit denies still apply.
+                one("--auto"),
                 group(&["--model", "{model}"]),
                 group(&["--variant", "{effort}"]),
                 one("--format"),
