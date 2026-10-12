@@ -2,6 +2,8 @@
 name = "chimera"
 version = "0.1.0"
 edition = "2024"
+# Oldest supported compiler; `cargo update` then only picks dependency versions that build with it.
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -23,4 +25,4 @@ tokio-stream = { version = "0.1.19", features = ["sync"] }
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.27.0", features = ["v4", "serde"] }
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
