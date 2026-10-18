@@ -1,7 +1,7 @@
 # Publishing Chimera
 
 Plan for releasing Chimera on crates.io, plus prebuilt binaries, so people can run
-`cargo install <crate>` or `cargo binstall <crate>` and get a `chimera` binary.
+`cargo install chimera-ai` or `cargo binstall chimera-ai` and get a `chimera` binary.
 
 crates.io only hosts source: `cargo install` compiles on the user's machine. Prebuilt binaries are
 attached to GitHub Releases. `cargo binstall` finds them there via metadata in `Cargo.toml` and
@@ -17,22 +17,13 @@ falls back to compiling when it can't.
 | Every dependency comes from crates.io (no path or git dependencies) | done |
 | Minimum Rust version declared (`rust-version = "1.88"`) and tested in CI | done |
 | CI: fmt, clippy, tests on Linux and macOS, Rust 1.88 | done (`.github/workflows/ci.yml`) |
-| Crate name | **blocked: `chimera` is taken on crates.io** |
+| Crate name `chimera-ai` (`chimera` is taken), command stays `chimera` | done |
 
 ## 1. Decisions to make first
 
-1. **Crate name.** `chimera` belongs to an unrelated crate ("Unified async Rust SDK for AI coding
-   agents"). Free as of 2026-10-18: `chimera-agents`, `chimera-orchestrator`, `agent-chimera`.
-   Rename only the package; keep the command as `chimera` with a `[[bin]]` section:
-   ```toml
-   [package]
-   name = "chimera-agents"
-
-   [[bin]]
-   name = "chimera"
-   path = "src/main.rs"
-   ```
-   Users then run `cargo install chimera-agents` and get `chimera`.
+1. **Crate name: decided, `chimera-ai`.** `chimera` belongs to an unrelated crate. The package is
+   renamed and a `[[bin]]` section keeps the command as `chimera`, so `cargo install chimera-ai`
+   installs `chimera`. The name is not reserved until the first `cargo publish`.
 2. **Sample teams in a public release.** `teams/scb-software-engineering.yaml` names SCB and its
    approved Copilot model set. Before publishing, decide whether that belongs in a public crate.
    Options: publish it as is, rename it to a generic "Copilot-only enterprise team", or drop it from
@@ -97,9 +88,8 @@ same from a laptop.
 
 ## 4. Before the first release
 
-- [ ] Decide the crate name and rename the package (decision 1); update the README install section.
 - [ ] Decide what happens to the SCB sample team (decision 2).
-- [ ] Add a "Install" section to the README: `cargo install <crate>`, `cargo binstall <crate>`,
+- [ ] Add a "Install" section to the README: `cargo install chimera-ai`, `cargo binstall chimera-ai`,
       release downloads, and the prerequisites (the agent CLIs themselves, optional `bwrap` on Linux).
 - [ ] Add `CHANGELOG.md` (Keep a Changelog format).
 - [ ] Add `cargo deny check` (licences, advisories, duplicate crates) or `cargo audit` to CI.
@@ -107,7 +97,7 @@ same from a laptop.
       are rewritten to point at the repository).
 - [ ] Smoke-test each prebuilt binary: `chimera --version`, start the server, open the UI, run a dry-run
       session.
-- [ ] Publish `0.1.0`, then confirm `cargo install <crate>` works on a clean machine.
+- [ ] Publish `0.1.0`, then confirm `cargo install chimera-ai` works on a clean machine.
 
 ## Notes
 

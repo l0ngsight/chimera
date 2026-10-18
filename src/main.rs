@@ -27,7 +27,7 @@ use crate::web::AppState;
 
 /// Chimera: multi-agent orchestration across Claude Code, Codex, opencode, Hermes and pi.
 #[derive(Parser)]
-#[command(version)]
+#[command(name = "chimera", version)]
 struct Cli {
     #[command(flatten)]
     opts: ServerOpts,

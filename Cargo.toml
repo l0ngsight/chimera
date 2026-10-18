@@ -1,5 +1,5 @@
 [package]
-name = "chimera"
+name = "chimera-ai"
 version = "0.1.0"
 edition = "2024"
 # Oldest supported compiler; `cargo update` then only picks dependency versions that build with it.
@@ -12,6 +12,11 @@ keywords = ["agents", "orchestration", "llm", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
 # Only what the binary needs to build (web assets and sample teams are compiled in) plus docs.
 include = ["src/**/*", "web/**/*", "teams/**/*", "testdata/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "chimera.example.yaml"]
+
+# The package is `chimera-ai` on crates.io (`chimera` is taken); the command is still `chimera`.
+[[bin]]
+name = "chimera"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
