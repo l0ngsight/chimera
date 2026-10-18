@@ -340,3 +340,7 @@ Source map: `model.rs` (teams/graph), `config.rs` (runtimes and LLM settings), `
 launching and output parsers), `orchestrator.rs` (scheduler, prompt building, message protocol, mock runtime),
 `session.rs` (state, events, persistence), `decisions.rs` (Jev client and decision questions), `catalog.rs` (model lists from CLIs), `promptgen.rs` (persona prompt generation), `web.rs` (API and SSE),
 `web/` (UI, embedded into the binary), `tui/` (terminal UI).
+
+## License
+
+[MIT](LICENSE)

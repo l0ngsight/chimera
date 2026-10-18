@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 # Oldest supported compiler; `cargo update` then only picks dependency versions that build with it.
 rust-version = "1.88"
+description = "Multi-agent orchestration across coding CLIs (Claude Code, Codex, opencode, Copilot, pi, Hermes) with a web UI and TUI"
+license = "MIT"
+repository = "https://github.com/l0ngsight/chimera"
+readme = "README.md"
+keywords = ["agents", "orchestration", "llm", "claude", "codex"]
+categories = ["command-line-utilities", "development-tools"]
+# Only what the binary needs to build (web assets and sample teams are compiled in) plus docs.
+include = ["src/**/*", "web/**/*", "teams/**/*", "testdata/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "chimera.example.yaml"]
 
 [dependencies]
 anyhow = "1.0.104"
