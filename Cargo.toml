@@ -1,6 +1,6 @@
 [package]
 name = "chimera-ai"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Oldest supported compiler; `cargo update` then only picks dependency versions that build with it.
 rust-version = "1.88"

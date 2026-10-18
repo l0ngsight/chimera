@@ -14,9 +14,9 @@ Chimera is published on crates.io as [`chimera-ai`](https://crates.io/crates/chi
 | `0.1.0` published on crates.io | done 2026-10-18, by hand; installs and runs (`cargo install chimera-ai --locked`) |
 | Package metadata, MIT license, `include` list, Rust 1.88 minimum | done |
 | CI: fmt, clippy, tests on Linux and macOS and Rust 1.88, `cargo package` | done (`.github/workflows/ci.yml`) |
-| Release workflow: binaries, GitHub Release, crates.io trusted publishing | done (`.github/workflows/release.yml`); first run with `0.1.1` |
+| Release workflow: binaries, GitHub Release, crates.io trusted publishing | done (`.github/workflows/release.yml`); first tagged run is `0.1.1` |
 | README Install section, `CHANGELOG.md`, `cargo binstall` metadata | done |
-| One-time GitHub and crates.io settings | **to do, see below** |
+| One-time GitHub and crates.io settings (below) | done 2026-10-18 |
 | Dependency licence and advisory check (`cargo deny` or `cargo audit`) in CI | to do |
 | Windows | not supported (agents and tests rely on `sh`; the process guard has no Windows backend) |
 

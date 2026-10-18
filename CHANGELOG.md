@@ -6,6 +6,8 @@ All notable changes to Chimera are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-18
+
 ### Added
 - Release workflow: tagging `vX.Y.Z` builds static Linux (x86_64, ARM) and macOS (Intel, Apple Silicon)
   binaries, attaches them to a GitHub Release and publishes the crate with crates.io trusted publishing.
@@ -30,5 +32,6 @@ First release, published as `chimera-ai` (the command is `chimera`).
 - Process guard (bubblewrap/unshare on Linux, sandbox-exec on macOS) so agents cannot stop the user's programs.
 - Sample teams: Software Development Team and Copilot Engineering Team.
 
-[Unreleased]: https://github.com/l0ngsight/chimera/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/l0ngsight/chimera/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/l0ngsight/chimera/releases/tag/v0.1.1
 [0.1.0]: https://crates.io/crates/chimera-ai/0.1.0
