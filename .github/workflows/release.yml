@@ -1,0 +1,130 @@
+name: Release
+
+# Push a tag like `v0.1.1` (matching `version` in Cargo.toml) to build binaries, create the
+# GitHub Release and publish the crate. See docs/PUBLISHING.md.
+on:
+  push:
+    tags: ["v*"]
+  # Manual run: checks and builds the binaries only (no release, no publish).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check version and tests
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: version
+        name: Tag must match Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$REF_TYPE" = tag ] && [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static binaries that run on any Linux distribution.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="chimera-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/chimera" README.md LICENSE chimera.example.yaml "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimera-${{ matrix.target }}
+          path: chimera-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub Release
+    needs: [check, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release with the binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v v="$VERSION" '/^## /{p = index($0, "[" v "]") > 0; next} /^\[[^]]+\]: /{p = 0} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Chimera $VERSION" > notes.md
+          gh release create "$TAG" dist/* --title "Chimera $VERSION" --notes-file notes.md --verify-tag
+
+  crates-io:
+    name: Publish to crates.io
+    needs: [check, github-release]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # Requires a reviewer's approval (configured on the `release` environment in GitHub).
+    environment: release
+    permissions:
+      id-token: write # trusted publishing: no API token is stored in GitHub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Skip if this version is already on crates.io
+        id: exists
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A "chimera-release (github.com/l0ngsight/chimera)" \
+            "https://crates.io/api/v1/crates/chimera-ai/$VERSION")
+          echo "published=$([ "$status" = 200 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.exists.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - if: steps.exists.outputs.published == 'false'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

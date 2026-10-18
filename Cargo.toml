@@ -11,12 +11,18 @@ readme = "README.md"
 keywords = ["agents", "orchestration", "llm", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
 # Only what the binary needs to build (web assets and sample teams are compiled in) plus docs.
-include = ["src/**/*", "web/**/*", "teams/**/*", "testdata/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "chimera.example.yaml"]
+include = ["src/**/*", "web/**/*", "teams/**/*", "testdata/**/*", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "chimera.example.yaml"]
 
 # The package is `chimera-ai` on crates.io (`chimera` is taken); the command is still `chimera`.
 [[bin]]
 name = "chimera"
 path = "src/main.rs"
+
+# `cargo binstall chimera-ai` downloads the release binaries built by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/chimera-{ target }.tar.gz"
+bin-dir = "chimera-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -39,3 +45,6 @@ tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
+
+[profile.release]
+strip = true
