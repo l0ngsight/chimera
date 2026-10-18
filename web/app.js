@@ -195,7 +195,9 @@ function createGraph(wrap, team, opts = {}) {
     for (const p of team.personas) {
       const at = pos[p.id];
       const status = opts.statusOf ? opts.statusOf(p.id) : null;
-      const sub = [p.runtime, p.model, p.effort].filter(Boolean).join(' · ');
+      // A persona working on a fallback after a usage limit shows what it runs on now.
+      const active = opts.activeOf ? opts.activeOf(p.id) : null;
+      const sub = active ? '↯ ' + active : [p.runtime, p.model, p.effort].filter(Boolean).join(' · ');
       const g = h('g', {
         class: ['node', status, selected === p.id && 'selected', connectFrom === p.id && 'connect-src'].filter(Boolean).join(' '),
         transform: `translate(${at.x - NODE_W / 2},${at.y - NODE_H / 2})`,
@@ -203,11 +205,11 @@ function createGraph(wrap, team, opts = {}) {
         h('rect', { class: 'box', width: NODE_W, height: NODE_H }),
         h('rect', { class: 'stripe', x: 0, y: 8, width: 4, height: NODE_H - 16, fill: runtimeColor(p.runtime) }),
         h('text', { class: 'title', x: 14, y: 22 }, ellipsize(p.name, 22)),
-        h('text', { class: 'sub', x: 14, y: 39 }, ellipsize(sub, 28)),
+        h('text', { class: 'sub' + (active ? ' fallback' : ''), x: 14, y: 39 }, ellipsize(sub, 28)),
         status ? h('circle', { class: 'st', cx: 20, cy: 51, r: 4 }) : null,
         status ? h('text', { class: 'status', x: 29, y: 54.5 }, status) : null,
         p.id === team.entry ? h('text', { class: 'entry-mark', x: NODE_W - 10, y: 16, 'text-anchor': 'end' }, 'ENTRY') : null,
-        h('title', {}, `${p.name}\n${p.role || ''}\nid: ${p.id}`));
+        h('title', {}, `${p.name}\n${p.role || ''}\nid: ${p.id}` + (active ? `\non fallback: ${active}` : '')));
       nodeEls[p.id] = g;
       attachNodeEvents(g, p.id);
       nodesG.append(g);
@@ -332,13 +334,23 @@ function createGraph(wrap, team, opts = {}) {
 function ellipsize(s, n) { s = s || ''; return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
 function runtimeColor(rt) {
-  return { claude: '#d97757', codex: '#10a37f', opencode: '#a78bfa', hermes: '#f5c542', mock: '#64748b' }[rt] || '#7c9cff';
+  return { claude: '#d97757', codex: '#10a37f', opencode: '#a78bfa', hermes: '#f5c542', pi: '#38bdf8', copilot: '#f472b6', mock: '#64748b' }[rt] || '#7c9cff';
 }
 
 // ---------------------------------------------------------------- sessions list
 
 async function sessionsPage() {
-  const [teams, sessions] = await Promise.all([api('GET', '/api/teams'), api('GET', '/api/sessions')]);
+  const [teams, sessions, settings] = await Promise.all([
+    api('GET', '/api/teams'), api('GET', '/api/sessions'), api('GET', '/api/settings').catch(() => null),
+  ]);
+  const guard = settings?.guard;
+  const guardWarning = guard && !(guard.available && guard.enabled)
+    ? h('div', { class: 'guard-warning' },
+      h('b', {}, '⚠ Process guard is off. '),
+      guard.enabled ? guard.detail : 'It was turned off in Settings.',
+      ' Agents run shell commands without asking and could quit your browser or other apps. ',
+      h('a', { href: '#/settings' }, 'Settings'))
+    : null;
   const preselect = new URLSearchParams(location.hash.split('?')[1] || '').get('team');
 
   const teamSel = h('select', {}, teams.map(t => h('option', { value: t.id }, t.name)));
@@ -386,7 +398,8 @@ async function sessionsPage() {
         h('label', {}, 'Working directory'), workdir,
         h('div', { class: 'row', style: 'margin-top:12px' },
           h('label', { class: 'inline', title: 'Every persona uses the built-in mock runtime: no CLI or LLM calls. Good for checking the graph.' }, dry, 'Dry run (mock agents)'),
-          h('span', { class: 'spacer' }), startBtn)),
+          h('span', { class: 'spacer' }), startBtn),
+        guardWarning),
       h('div', { class: 'card' },
         h('h2', {}, 'Sessions'),
         h('table', {}, h('thead', {}, h('tr', {}, ['Session', 'Team', 'Status', 'Agents', 'Turns', 'Started'].map(c => h('th', {}, c)))), listBody)))));
@@ -395,12 +408,15 @@ async function sessionsPage() {
 // ---------------------------------------------------------------- session view
 
 async function sessionPage(id) {
-  const data = await api('GET', '/api/sessions/' + id);
-  const team = data.team;
+  const [data, settings] = await Promise.all([api('GET', '/api/sessions/' + id), api('GET', '/api/settings').catch(() => ({}))]);
+  let team = data.team;
+  const jevRouting = settings.decisions_active && settings.decisions.route_user_messages && !data.summary.dry_run;
   let summary = data.summary;
   const events = [];
   let lastSeq = 0;
   const agentStatus = Object.fromEntries(Object.entries(summary.agents).map(([k, a]) => [k, a.status]));
+  // "runtime · model · effort" of personas running on a fallback after a usage limit.
+  const activeConfig = Object.fromEntries(Object.entries(summary.agents).filter(([, a]) => a.active).map(([k, a]) => [k, a.active]));
   let selected = null;
   let tab = 'timeline';
   const personaName = pid => pid === 'user' ? 'You' : (team.personas.find(p => p.id === pid)?.name || pid);
@@ -432,6 +448,7 @@ async function sessionPage(id) {
     h('div', { class: 'graph-hint' }, 'Click a persona to see its log'));
   const graph = createGraph(graphWrap, team, {
     statusOf: pid => agentStatus[pid] || 'idle',
+    activeOf: pid => activeConfig[pid],
     onSelect: pid => { selected = pid; tab = pid ? 'log' : 'timeline'; renderPanel(); },
   });
   onLeave(() => graph.destroy());
@@ -441,8 +458,10 @@ async function sessionPage(id) {
   const panelSub = h('span', { class: 'muted small' });
   const tabs = h('div', { class: 'tabs' });
   const body = h('div', { class: 'panel-body' });
-  const toSel = h('select', { style: 'width:auto' }, team.personas.map(p => h('option', { value: p.id }, p.name + (p.id === team.entry ? ' (entry)' : ''))));
-  toSel.value = team.entry;
+  const toSel = h('select', { style: 'width:auto' },
+    jevRouting ? h('option', { value: 'auto', title: 'Jev picks the persona best suited to answer' }, '⚡ Auto (Jev routes)') : null,
+    team.personas.map(p => h('option', { value: p.id }, p.name + (p.id === team.entry ? ' (entry)' : ''))));
+  toSel.value = jevRouting ? 'auto' : team.entry;
   const msgInput = h('textarea', { placeholder: 'Send a message or follow-up instruction…' });
   const sendBtn = h('button', { class: 'primary', onclick: send }, 'Send');
   msgInput.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send(); });
@@ -455,11 +474,15 @@ async function sessionPage(id) {
     sendBtn.disabled = false;
   }
 
+  const personaSub = p => activeConfig[p.id]
+    ? `${p.role || ''} · ↯ on fallback ${activeConfig[p.id]}`
+    : `${p.role || ''} · ${p.runtime}${p.model ? ' / ' + p.model : ''} · ${p.effort}`;
+
   function renderPanel() {
     const p = selected && team.personas.find(x => x.id === selected);
     if (p) {
       panelTitle.textContent = p.name;
-      panelSub.textContent = `${p.role || ''} · ${p.runtime}${p.model ? ' / ' + p.model : ''} · ${p.effort}`;
+      panelSub.textContent = personaSub(p);
       toSel.value = p.id;
       tabs.replaceChildren(
         h('button', { class: tab === 'log' ? 'active' : '', onclick: () => { tab = 'log'; renderPanel(); } }, 'Log'),
@@ -487,7 +510,8 @@ async function sessionPage(id) {
   }
 
   function matches(e) {
-    if (!selected) return e.type === 'message' || e.type === 'final' || e.type === 'session_status';
+    if (!selected) return ['message', 'final', 'session_status', 'decision', 'team_updated', 'fallback'].includes(e.type);
+    if (e.type === 'team_updated') return e.changes.some(c => c.startsWith(selected));
     if (e.type === 'message') return e.from === selected || e.to === selected;
     return e.agent === selected && e.type !== 'agent_status';
   }
@@ -501,20 +525,49 @@ async function sessionPage(id) {
             selected ? (toMe ? '← from ' : '→ to ') : null,
             selected ? h('b', {}, personaName(toMe ? e.from : e.to)) : [h('b', {}, personaName(e.from)), ' → ', h('b', {}, personaName(e.to))],
             e.rejected ? h('span', { style: 'color:var(--error)' }, '(not delivered: no channel)') : null,
+            e.deferred ? h('span', { class: 'jev', title: 'Jev judged this an acknowledgement: delivered without starting a turn; read on the next one' }, '⚡ deferred') : null,
             h('span', { class: 'spacer' }), fmtTime(e.ts)),
           h('div', { class: 'msg-body' }, e.content));
       }
       case 'final':
         return h('div', { class: 'msg final' }, h('div', { class: 'msg-head' }, '✔ Final answer from ', h('b', {}, personaName(e.agent))), h('div', { class: 'msg-body' }, e.content));
+      case 'team_updated':
+        return h('div', { class: 'status-line team-updated' }, `✎ team updated · ${fmtTime(e.ts)}`,
+          h('ul', {}, e.changes.filter(c => !selected || c.startsWith(selected)).map(c => h('li', {}, c))));
+      case 'fallback':
+        return h('div', { class: 'fallback-line' },
+          h('b', {}, `↯ ${personaName(e.agent)} ${e.level ? 'switched to a fallback' : 'is back on its primary'}`),
+          `: ${e.from} → ${e.to} · ${fmtTime(e.ts)}`,
+          h('div', { class: 'muted small' }, e.reason + (e.until ? ` (resets around ${new Date(e.until).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })})` : '')));
       case 'session_status':
         return h('div', { class: 'status-line' }, `session ${e.status}${e.detail ? ' — ' + e.detail : ''} · ${fmtTime(e.ts)}`);
       case 'turn_start':
         return h('div', { class: 'turn-sep' }, `turn #${e.turn} · ${fmtTime(e.ts)}`);
       case 'turn_end':
         return h('div', { class: 'status-line' }, `turn #${e.turn} finished in ${(e.duration_ms / 1000).toFixed(1)}s` + (e.error ? ` with error` : ''));
+      case 'decision': return renderDecision(e);
       case 'log': return renderLog(e);
       default: return null;
     }
+  }
+
+  function renderDecision(e) {
+    const label = { ack_filter: 'ack filter', resolve_recipient: 'recipient', detect_final: 'completion', route_user: 'routing', advise_effort: 'effort' }[e.kind] || e.kind;
+    const outcome = e.kind === 'route_user' || e.kind === 'resolve_recipient' ? personaName(e.outcome) : e.outcome;
+    const effect = !e.applied ? '' : {
+      ack_filter: ' → delivered without waking',
+      resolve_recipient: ' → message re-addressed',
+      detect_final: ' → session completed',
+      route_user: ' → message sent there',
+      advise_effort: ' → used for this turn',
+    }[e.kind] || '';
+    return h('div', { class: 'decision' + (e.error ? ' failed' : e.applied ? ' applied' : '') },
+      h('span', { class: 'jev' }, '⚡ Jev'), ' ', h('b', {}, label), ' · ', e.subject, ': ',
+      e.error ? h('span', { title: e.error }, 'skipped (' + e.error.slice(0, 120) + ')') : [
+        h('b', {}, outcome),
+        e.confidence != null ? h('span', { class: 'muted' }, ` (${Math.round(e.confidence * 100)}% conf, ${e.latency_ms}ms${e.cost != null ? ', $' + e.cost.toFixed(5) : ''})`) : null,
+        effect,
+      ]);
   }
 
   function renderLog(e) {
@@ -533,7 +586,17 @@ async function sessionPage(id) {
     let rerender = false;
     if (e.type === 'agent_status') { agentStatus[e.agent] = e.status; graph.setStatus(e.agent, e.status); }
     if (e.type === 'session_status') { summary.status = e.status; summary.status_detail = e.detail; updateHeader(); }
+    if (e.type === 'fallback') {
+      if (e.level) activeConfig[e.agent] = e.to; else delete activeConfig[e.agent];
+      graph.render();
+      const p = team.personas.find(x => x.id === e.agent);
+      if (p && selected === e.agent) panelSub.textContent = personaSub(p);
+    }
     if (e.type === 'turn_start') { summary.total_turns = Math.max(summary.total_turns, e.turn); updateHeader(); }
+    // The team was edited: reload it so the graph shows the new models.
+    if (e.type === 'team_updated' && live) {
+      api('GET', '/api/sessions/' + id).then(d => { team = d.team; graph.setTeam(team); }).catch(() => {});
+    }
     if (e.type === 'message' && live && !e.rejected) graph.flash(e.from, e.to);
     if (live && matches(e) && tab !== 'persona') {
       if (body.querySelector('.empty')) rerender = true;
@@ -618,7 +681,129 @@ async function teamsPage() {
 
 // ---------------------------------------------------------------- team editor
 
-const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const MAX_MODEL_ROWS = 100;
+
+/**
+ * Model combobox fed by the runtime's own model list (asked from its CLI or API by the server).
+ *
+ * Deliberately not a native <select>: CLIs such as opencode can list thousands of models, and a
+ * native popup that long is drawn by the browser process itself (shared by every window) and can
+ * hang or crash it. This list lives in the page, filters as you type and renders at most
+ * MAX_MODEL_ROWS rows. Any typed text is accepted as a custom model id.
+ */
+function modelPicker(p, onChange) {
+  const input = h('input', { value: p.model, placeholder: 'runtime default — type to search', autocomplete: 'off', spellcheck: 'false' });
+  const menu = h('div', { class: 'combo-menu hidden', role: 'listbox' });
+  const info = h('div', { class: 'small muted', style: 'margin-top:4px' });
+  let list = null, loadSeq = 0, autoPick = false, rows = [], active = -1;
+  const models = () => list?.models || [];
+  const current = () => models().find(m => m.id === p.model);
+
+  async function load(refresh) {
+    const seq = ++loadSeq, runtime = p.runtime;
+    info.replaceChildren(h('span', { class: 'spinner' }), ' asking the CLI for its models…');
+    let res;
+    try { res = await api('GET', `/api/runtimes/${encodeURIComponent(runtime)}/models${refresh ? '?refresh=true' : ''}`); }
+    catch (e) { res = { models: [], error: e.message }; }
+    if (seq !== loadSeq) return; // a newer runtime was picked meanwhile
+    list = res;
+    if (autoPick && !p.model && models().length) { p.model = models()[0].id; input.value = p.model; onChange(); }
+    autoPick = false;
+    renderInfo();
+    if (!menu.classList.contains('hidden')) renderMenu();
+  }
+
+  function commit(id) {
+    id = id.trim();
+    input.value = id;
+    close();
+    if (id === p.model) return;
+    p.model = id;
+    renderInfo();
+    onChange();
+  }
+
+  function open() { menu.classList.remove('hidden'); renderMenu(); }
+  function close() { menu.classList.add('hidden'); active = -1; }
+
+  function renderMenu() {
+    const q = input.value.trim().toLowerCase();
+    // Show everything while the field still holds the current model; filter once the user types.
+    const filter = q && q !== (p.model || '').toLowerCase();
+    const matches = filter
+      ? models().filter(m => [m.id, m.name, m.group].some(v => v && v.toLowerCase().includes(q)))
+      : models();
+    rows = matches.slice(0, MAX_MODEL_ROWS);
+    const items = [];
+    let group;
+    rows.forEach((m, i) => {
+      if ((m.group || '') !== group) {
+        group = m.group || '';
+        if (group) items.push(h('div', { class: 'combo-group' }, group));
+      }
+      items.push(h('div', {
+        class: 'combo-item' + (m.id === p.model ? ' selected' : '') + (i === active ? ' active' : ''),
+        role: 'option',
+        onmousedown: e => { e.preventDefault(); commit(m.id); },
+      },
+        h('span', {}, m.name && m.name !== m.id ? m.name : m.id),
+        m.name && m.name !== m.id ? h('span', { class: 'muted mono small' }, ' ' + m.id) : null,
+        m.context ? h('span', { class: 'muted small' }, ` · ${Math.round(m.context / 1000)}k`) : null));
+    });
+    if (!matches.length) {
+      items.push(h('div', { class: 'combo-note' }, models().length
+        ? `No listed model matches — press Enter to use “${input.value.trim()}” as a custom id.`
+        : 'No model list available — type a model id.'));
+    } else if (matches.length > rows.length) {
+      items.push(h('div', { class: 'combo-note' }, `${matches.length - rows.length} more — keep typing to narrow down.`));
+    }
+    menu.replaceChildren(...items);
+    menu.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function renderInfo() {
+    const parts = [];
+    if (list?.error) parts.push(h('span', { class: 'avail no', title: list.error }, '⚠ ' + list.error.slice(0, 160) + ' — showing suggestions. '));
+    else if (list?.source === 'cli') parts.push(`${models().length} models from `, h('code', {}, list.via), '. ');
+    else if (list?.source === 'api') parts.push(`${models().length} models (aliases + ${list.via}). `);
+    else if (list?.note) parts.push(list.note + ' ');
+    if (p.model && list && !current()) parts.push(h('span', {}, 'Custom id (not in the list). '));
+    parts.push(h('a', { href: 'javascript:void 0', onclick: () => load(true) }, '↻ refresh'));
+    const m = current();
+    if (m?.description) parts.push(h('div', {}, m.description));
+    info.replaceChildren(...parts);
+  }
+
+  input.addEventListener('focus', () => { input.select(); open(); });
+  input.addEventListener('input', () => { active = -1; open(); });
+  input.addEventListener('blur', () => commit(input.value));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (menu.classList.contains('hidden')) open();
+      if (!rows.length) return;
+      active = (active + (e.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length;
+      renderMenu();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      commit(active >= 0 && rows[active] ? rows[active].id : input.value);
+      input.blur();
+    } else if (e.key === 'Escape') {
+      input.value = p.model;
+      close();
+      input.blur();
+    }
+  });
+
+  return {
+    el: h('div', { class: 'combo' }, input, menu, info),
+    load,
+    current,
+    /** Called when the runtime changes: forget the old model and fetch the new list. */
+    reset() { p.model = ''; input.value = ''; list = null; autoPick = true; renderInfo(); load(false); },
+  };
+}
 
 async function teamEditorPage(teamId) {
   const isNew = teamId === 'new';
@@ -630,6 +815,7 @@ async function teamEditorPage(teamId) {
   let connectMode = false;
   let bidiDefault = true;
   const dirtyEl = h('span', { class: 'dirty' });
+  const applyBox = h('input', { type: 'checkbox', checked: true });
   const setDirty = d => { window.__dirty = d; dirtyEl.textContent = d ? '● unsaved changes' : ''; };
   setDirty(isNew);
   onLeave(() => setDirty(false));
@@ -705,9 +891,10 @@ async function teamEditorPage(teamId) {
     team.personas.forEach(p => { if (pos[p.id]) p.position = { x: Math.round(pos[p.id].x), y: Math.round(pos[p.id].y) }; });
     try {
       if (isNew) await api('POST', '/api/teams', team);
-      else await api('PUT', '/api/teams/' + team.id, team);
+      let updated = 0;
+      if (!isNew) updated = (await api('PUT', `/api/teams/${team.id}?apply_to_sessions=${applyBox.checked}`, team)).sessions_updated || 0;
       setDirty(false);
-      toast('Team saved');
+      toast(updated ? `Team saved · applied to ${updated} session${updated > 1 ? 's' : ''} (from each agent's next turn)` : 'Team saved');
       if (isNew) location.hash = '#/team/' + team.id;
     } catch (e) { toast(e.message, true); }
   }
@@ -731,7 +918,7 @@ async function teamEditorPage(teamId) {
       h('div', {}, team.personas.map(p => h('div', { class: 'row', style: 'margin:4px 0' },
         h('span', { class: 'dot', style: `background:${runtimeColor(p.runtime)}` }),
         h('a', { href: 'javascript:void 0', onclick: () => { selection = { kind: 'persona', id: p.id }; graph.select(p.id); renderSide(); } }, p.name),
-        h('span', { class: 'muted small' }, `${p.runtime} · ${p.model || 'default model'} · ${p.effort}`)))));
+        h('span', { class: 'muted small' }, `${p.runtime} · ${p.model || 'default model'} · ${p.effort}` + (p.fallbacks?.length ? ` · ↯ ${p.fallbacks.map(f => f.runtime).join(', ')}` : ''))))));
   }
 
   const nameOf = id => team.personas.find(p => p.id === id)?.name || id;
@@ -750,21 +937,26 @@ async function teamEditorPage(teamId) {
   function personaForm(p) {
     const changed = (rerenderGraph = true) => { setDirty(true); if (rerenderGraph) graph.render(); };
     const rtSel = h('select', {
-      onchange: e => {
-        p.runtime = e.target.value;
-        const rt = rts.find(r => r.name === p.runtime);
-        if (rt && rt.models.length && !rt.models.includes(p.model)) { p.model = rt.models[0]; modelIn.value = p.model; }
-        refreshModels(); changed();
-      },
+      onchange: e => { p.runtime = e.target.value; picker.reset(); changed(); renderEfforts(); },
     }, rts.map(r => h('option', { value: r.name }, `${r.label || r.name}${r.available ? '' : ' (not installed)'}`)));
     rtSel.value = p.runtime;
-    const listId = 'models-' + Math.random().toString(36).slice(2);
-    const modelList = h('datalist', { id: listId });
-    const refreshModels = () => modelList.replaceChildren(...(rts.find(r => r.name === p.runtime)?.models || []).map(m => h('option', { value: m })));
-    refreshModels();
-    const modelIn = h('input', { value: p.model, list: listId, placeholder: 'runtime default', oninput: e => { p.model = e.target.value; changed(); } });
-    const effortSel = h('select', { onchange: e => { p.effort = e.target.value; changed(); } }, EFFORTS.map(x => h('option', { value: x }, x)));
+    // The options of this native <select> are built once and never touched again: rewriting a
+    // native select's options while its popup may be open (e.g. when the model list finishes
+    // loading) is a known way to crash Chrome's browser process on macOS.
+    const effortSel = h('select', { onchange: e => { p.effort = e.target.value; changed(); renderEfforts(); } },
+      EFFORTS.map(x => h('option', { value: x }, x)));
     effortSel.value = p.effort;
+    const effortNote = h('div', { class: 'small avail no' });
+    // Warn when the chosen model does not support the effort (after the runtime's effort mapping).
+    const renderEfforts = () => {
+      const supported = picker.current()?.efforts;
+      const map = rts.find(r => r.name === p.runtime)?.effort_map || {};
+      const ok = e => !supported?.length || map[e] === '' || supported.includes(map[e] ?? e);
+      effortNote.textContent = ok(p.effort) ? '' : `${p.model} does not support “${p.effort}” effort (supports: ${supported.join(', ')}).`;
+    };
+    const picker = modelPicker(p, () => { changed(); renderEfforts(); });
+    picker.load(false).then(renderEfforts);
+    renderEfforts();
     const idIn = h('input', { value: p.id });
     idIn.addEventListener('change', () => {
       const nid = slug(idIn.value);
@@ -809,17 +1001,55 @@ async function teamEditorPage(teamId) {
     });
     const rt = rts.find(r => r.name === p.runtime);
 
+    // Fallbacks: tried in order when the runtime above hits a usage, session or rate limit.
+    const fallbacksEl = h('div', { class: 'fallbacks' });
+    function renderFallbacks() {
+      const list = p.fallbacks || [];
+      fallbacksEl.replaceChildren(
+        ...list.map((f, i) => fallbackRow(f, i, list)),
+        h('button', {
+          class: 'small', onclick: () => {
+            const other = rts.find(r => r.name !== p.runtime && r.available && r.name !== 'mock') || rts.find(r => r.name !== p.runtime) || rts[0];
+            p.fallbacks = [...list, { runtime: other.name, model: '', effort: p.effort }];
+            changed(false);
+            renderFallbacks();
+          },
+        }, '+ Add fallback'));
+    }
+    function fallbackRow(f, i, list) {
+      const fp = modelPicker(f, () => changed(false));
+      const rtSel = h('select', { onchange: e => { f.runtime = e.target.value; fp.reset(); changed(false); } },
+        rts.map(r => h('option', { value: r.name }, `${r.label || r.name}${r.available ? '' : ' (not installed)'}`)));
+      rtSel.value = f.runtime;
+      const effSel = h('select', { onchange: e => { f.effort = e.target.value; changed(false); } }, EFFORTS.map(x => h('option', { value: x }, x)));
+      effSel.value = f.effort || 'medium';
+      fp.load(false);
+      const move = d => { const l = [...list]; [l[i], l[i + d]] = [l[i + d], l[i]]; p.fallbacks = l; changed(false); renderFallbacks(); };
+      return h('div', { class: 'fallback-row' },
+        h('div', { class: 'row' },
+          h('b', { class: 'small' }, `${i + 1}.`), rtSel, effSel,
+          h('button', { class: 'small', title: 'Try earlier', disabled: i === 0, onclick: () => move(-1) }, '↑'),
+          h('button', { class: 'small danger', title: 'Remove', onclick: () => { p.fallbacks = list.filter(x => x !== f); changed(false); renderFallbacks(); } }, '×')),
+        fp.el);
+    }
+    renderFallbacks();
+
     return h('div', {},
       h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, 'Persona'), h('button', { onclick: () => { selection = null; graph.select(null); renderSide(); } }, '×')),
       h('div', { class: 'grid', style: 'grid-template-columns:1fr 1fr;gap:0 10px' },
         h('div', {}, h('label', {}, 'Name'), h('input', { value: p.name, oninput: e => { p.name = e.target.value; changed(); refreshEntry(); } })),
         h('div', {}, h('label', {}, 'Id (used in messages)'), idIn)),
       h('label', {}, 'Role'), h('input', { value: p.role, placeholder: 'e.g. Senior Backend Engineer', oninput: e => { p.role = e.target.value; changed(false); } }),
-      h('div', { class: 'grid', style: 'grid-template-columns:1fr 1fr 110px;gap:0 10px' },
+      h('div', { class: 'grid', style: 'grid-template-columns:1fr 150px;gap:0 10px' },
         h('div', {}, h('label', {}, 'Runtime'), rtSel),
-        h('div', {}, h('label', {}, 'Model'), modelIn, modelList),
         h('div', {}, h('label', {}, 'Effort'), effortSel)),
+      effortNote,
+      h('label', {}, 'Model'), picker.el,
       rt && !rt.available ? h('div', { class: 'avail no' }, `“${rt.command}” was not found on PATH of the server.`) : null,
+      h('details', { class: 'fallback-box', open: !!(p.fallbacks || []).length },
+        h('summary', {}, 'Fallbacks on usage limits', (p.fallbacks || []).length ? h('span', { class: 'muted' }, ` (${p.fallbacks.length})`) : null),
+        h('div', { class: 'small muted' }, 'When the runtime above reports a usage, session or rate limit (e.g. Claude Code “usage limit reached”, Codex “you’ve hit your usage limit”), the persona retries the same messages on the first fallback that is not limited, and returns to its primary once the limit resets.'),
+        fallbacksEl),
       h('div', { class: 'gen-box' },
         h('div', { class: 'small muted' }, 'Describe the persona and let the configured LLM write its prompt (see Settings).'),
         desc,
@@ -850,6 +1080,7 @@ async function teamEditorPage(teamId) {
         h('div', { class: 'row' }, h('a', { href: '#/teams' }, '← Teams'), h('h1', { style: 'margin:0 0 0 8px' }, isNew ? 'New team' : team.name), dirtyEl,
           h('span', { class: 'spacer' }),
           isNew ? null : h('a', { class: 'btn', href: '#/?team=' + team.id }, 'Start session'),
+          isNew ? null : h('label', { class: 'inline small', title: 'Changes take effect from each agent\'s next turn; a turn already running finishes on the old settings.' }, applyBox, 'apply to existing sessions'),
           h('button', { class: 'primary', onclick: save }, 'Save team')),
         h('div', { class: 'card' },
           h('div', { class: 'team-meta' },
@@ -883,6 +1114,115 @@ const PRESETS = {
   'Ollama (local)': { api: 'openai', base_url: 'http://localhost:11434/v1', model: 'llama3.3', api_key_env: 'OLLAMA_API_KEY' },
 };
 
+const JEV_PROVIDERS = {
+  OpenRouter: { base_url: 'https://openrouter.ai/api/v1', model: 'jev-latest', api_key_env: 'JEV_API_KEY', timeout_ms: 5000 },
+  'TypeSafe direct': { base_url: 'https://api.typesafe.ai/v1', model: 'jev-latest', api_key_env: 'TYPESAFE_API_KEY', timeout_ms: 5000 },
+  // Ollama 0.35+ serves the same System One API locally; no key. Local models need longer for the first (cold) call.
+  'Ollama (local)': { base_url: 'http://localhost:11434/v1', model: 'nimble', api_key_env: '', timeout_ms: 30000 },
+};
+
+/** The OS sandbox that stops agents from killing or quitting the user's programs. */
+function guardCard(settings) {
+  const g = settings.guard;
+  const box = h('input', { type: 'checkbox', checked: g.enabled });
+  const state = h('div', { class: 'small' });
+  const show = s => {
+    const on = s.available && s.enabled;
+    state.className = 'small ' + (on ? 'muted' : 'avail no');
+    state.textContent = (on ? '✔ Protecting your programs — ' : !s.available ? '✖ Not available — ' : '✖ Turned off — ') + s.detail;
+  };
+  show(g);
+  box.addEventListener('change', async () => {
+    if (!box.checked && !confirm('Turn off the process guard? Agents will be able to kill or quit any of your programs, including your browser.')) {
+      box.checked = true;
+      return;
+    }
+    try { show((await api('PUT', '/api/settings', { guard_enabled: box.checked })).guard); toast('Process guard ' + (box.checked ? 'on' : 'off')); }
+    catch (e) { toast(e.message, true); box.checked = !box.checked; }
+  });
+  return h('div', { class: 'card', style: 'grid-column: 1 / -1' },
+    h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, '🛡 Process guard'), h('label', { class: 'inline' }, box, 'Enabled')),
+    h('p', { class: 'muted small' },
+      'Agents run shell commands without asking. The guard runs every agent inside an OS sandbox so it cannot kill or quit programs it did not start — your browser, editors, this server — while it can still stop its own processes. Linux: a private process namespace (bubblewrap, or unshare); the agent cannot even see your other programs, and anything it leaves running is stopped with it. macOS: sandbox-exec. Checked on this machine at startup.'),
+    state);
+}
+
+/** Settings for quick orchestration decisions with Jev. */
+function jevCard(settings) {
+  const d = settings.decisions;
+  const num = (v, step = '0.05') => h('input', { type: 'number', step, min: 0, max: 1, value: v, style: 'width:90px' });
+  const f = {
+    enabled: h('input', { type: 'checkbox', checked: d.enabled }),
+    base_url: h('input', { value: d.base_url }),
+    model: h('input', { value: d.model }),
+    api_key_env: h('input', { value: d.api_key_env, class: 'mono' }),
+    timeout_ms: h('input', { type: 'number', min: 100, step: 100, value: d.timeout_ms, style: 'width:110px' }),
+    ack_filter: h('input', { type: 'checkbox', checked: d.ack_filter }),
+    ack_min_confidence: num(d.ack_min_confidence),
+    resolve_recipients: h('input', { type: 'checkbox', checked: d.resolve_recipients }),
+    resolve_min_confidence: num(d.resolve_min_confidence),
+    detect_final: h('input', { type: 'checkbox', checked: d.detect_final }),
+    final_threshold: num(d.final_threshold),
+    route_user_messages: h('input', { type: 'checkbox', checked: d.route_user_messages }),
+    route_min_confidence: num(d.route_min_confidence),
+    advise_effort: h('input', { type: 'checkbox', checked: d.advise_effort }),
+    effort_min_confidence: num(d.effort_min_confidence),
+    effort_can_raise: h('input', { type: 'checkbox', checked: d.effort_can_raise }),
+  };
+  const status = h('div', { class: 'small' });
+  const showStatus = s => {
+    status.className = 'small ' + (s.decisions_active ? 'muted' : 'avail no');
+    status.textContent = s.decisions_active
+      ? (s.decisions.api_key_env.trim() ? `✔ active, key read from $${s.decisions_key_env}` : '✔ active, no API key (local server)')
+      : !s.decisions.enabled ? '✖ disabled' : `✖ no API key: set $${s.decisions.api_key_env} (or JEV_API_KEY / OPENROUTER_API_KEY / TYPESAFE_API_KEY) for the server`;
+  };
+  showStatus(settings);
+  const testOut = h('span', { class: 'muted small' });
+  const values = () => {
+    const out = {};
+    for (const [k, el] of Object.entries(f)) out[k] = el.type === 'checkbox' ? el.checked : el.type === 'number' ? +el.value : el.value;
+    return out;
+  };
+  async function save() {
+    try { showStatus(await api('PUT', '/api/settings', { decisions: values() })); toast('Jev settings saved'); }
+    catch (e) { toast(e.message, true); }
+  }
+  async function test() {
+    testOut.replaceChildren(h('span', { class: 'spinner' }));
+    try {
+      await save();
+      const r = await api('POST', '/api/decisions/test');
+      testOut.textContent = `✔ ${r.model} answered in ${r.latency_ms}ms` + (r.cost != null ? ` ($${r.cost.toFixed(5)})` : '');
+    } catch (e) { testOut.textContent = ''; toast(e.message, true); }
+  }
+  const toggle = (box, text, thr, thrLabel) => h('div', { class: 'row', style: 'margin:8px 0' },
+    h('label', { class: 'inline', style: 'flex:1' }, box, text),
+    thr ? h('span', { class: 'muted small' }, thrLabel) : null, thr);
+  return h('div', { class: 'card', style: 'grid-column: 1 / -1' },
+    h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, '⚡ Quick decisions (Jev)'), h('label', { class: 'inline' }, f.enabled, 'Enabled')),
+    h('p', { class: 'muted small' },
+      'Jev (TypeSafe’s decision model) makes cheap ~100ms calls between agent turns. Each one only adjusts routing; if Jev is off or fails, Chimera behaves as without it. Decisions appear in the session timeline. Dry runs never call Jev.'),
+    status,
+    h('div', { class: 'row', style: 'margin-top:10px' }, h('span', { class: 'muted small' }, 'Provider:'),
+      Object.entries(JEV_PROVIDERS).map(([name, p]) => h('button', {
+        onclick: () => { for (const k of ['base_url', 'model', 'api_key_env', 'timeout_ms']) f[k].value = p[k]; },
+      }, name))),
+    h('div', { class: 'grid', style: 'grid-template-columns: 2fr 1fr 1fr 120px; gap: 0 10px' },
+      h('div', {}, h('label', {}, 'Base URL'), f.base_url),
+      h('div', {}, h('label', {}, 'Model'), f.model),
+      h('div', {}, h('label', {}, 'API key env var (empty = no key)'), f.api_key_env),
+      h('div', {}, h('label', {}, 'Timeout (ms)'), f.timeout_ms)),
+    h('div', { style: 'margin-top:12px' },
+      toggle(f.ack_filter, 'Don’t wake a persona for pure acknowledgements (“thanks”, “sounds good”); they are read on its next turn', f.ack_min_confidence, 'min confidence'),
+      toggle(f.resolve_recipients, 'Re-address messages sent to an unknown teammate id (e.g. “backend_engineer” → backend)', f.resolve_min_confidence, 'min confidence'),
+      toggle(f.detect_final, 'Complete the session when the entry persona reports the task done but forgets <final>', f.final_threshold, 'min probability'),
+      toggle(f.route_user_messages, 'Offer “Auto” as recipient of your follow-up messages', f.route_min_confidence, 'min confidence'),
+      toggle(f.advise_effort, 'Advise effort: before each turn, pick the reasoning effort the work needs (never above the persona’s configured effort), e.g. low for a quick fix, high for a design review', f.effort_min_confidence, 'min confidence'),
+      h('label', { class: 'inline small', style: 'margin:-2px 0 8px 26px' }, f.effort_can_raise, 'Allow one level above the configured effort for unusually hard turns (check that the model supports it)')),
+    h('div', { class: 'row', style: 'margin-top:14px' }, testOut, h('span', { class: 'spacer' }),
+      h('button', { onclick: test }, 'Test connection'), h('button', { class: 'primary', onclick: save }, 'Save')));
+}
+
 async function settingsPage() {
   const [settings, rts] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/runtimes')]);
   const cfg = settings.prompt_llm;
@@ -898,7 +1238,7 @@ async function settingsPage() {
   async function save() {
     try {
       const res = await api('PUT', '/api/settings', {
-        api: f.api.value, base_url: f.base_url.value, model: f.model.value, api_key_env: f.api_key_env.value, temperature: +f.temperature.value,
+        prompt_llm: { api: f.api.value, base_url: f.base_url.value, model: f.model.value, api_key_env: f.api_key_env.value, temperature: +f.temperature.value },
       });
       keyStatus.textContent = res.api_key_present ? '✔ key found in the server environment' : '✖ variable not set in the server environment';
       keyStatus.className = 'small ' + (res.api_key_present ? 'muted' : 'avail no');
@@ -919,16 +1259,18 @@ async function settingsPage() {
         h('label', {}, 'API key environment variable'), f.api_key_env, keyStatus,
         h('label', {}, 'Temperature'), f.temperature,
         h('div', { class: 'row', style: 'margin-top:14px' }, h('span', { class: 'spacer' }), h('button', { class: 'primary', onclick: save }, 'Save'))),
-      h('div', { class: 'card' },
+      guardCard(settings),
+      jevCard(settings),
+      h('div', { class: 'card', style: 'grid-column: 1 / -1' },
         h('h2', {}, 'Agent runtimes'),
         h('p', { class: 'muted small' }, 'Configured in chimera.yaml (command templates, output parsers, model suggestions).'),
         h('table', {},
-          h('thead', {}, h('tr', {}, ['Runtime', 'Command', 'Status', 'Models'].map(c => h('th', {}, c)))),
+          h('thead', {}, h('tr', {}, ['Runtime', 'Command', 'Status', 'Model list from'].map(c => h('th', {}, c)))),
           h('tbody', {}, rts.map(r => h('tr', {},
             h('td', {}, h('span', { class: 'dot', style: `display:inline-block;margin-right:6px;background:${runtimeColor(r.name)}` }), h('b', {}, r.name), h('div', { class: 'muted small' }, r.label)),
             h('td', { class: 'mono' }, r.command || '—'),
             h('td', {}, r.available ? h('span', { class: 'badge completed' }, 'available') : h('span', { class: 'badge idle' }, 'not on PATH')),
-            h('td', { class: 'small muted' }, r.models.join(', '))))))))));
+            h('td', { class: 'small muted mono' }, r.models_via)))))))));
 }
 
 route();

@@ -133,6 +133,7 @@ tr.clickable:hover td { background: var(--panel-2); }
 .node .title { fill: var(--text); font-size: 13px; font-weight: 600; }
 .node .sub { fill: var(--muted); font-size: 11px; }
 .node .status { fill: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; }
+.node .sub.fallback { fill: var(--queued); }
 .node .entry-mark { fill: var(--accent); font-size: 10px; font-weight: 700; }
 .node circle.st { fill: var(--idle); }
 .node.queued circle.st { fill: var(--queued); }
@@ -220,3 +221,36 @@ tr.clickable:hover td { background: var(--panel-2); }
   .team-meta { grid-template-columns: 1fr 1fr; }
   .page.full { height: auto; }
 }
+
+/* ---------- Jev decisions ---------- */
+.jev { color: #fbbf24; font-weight: 600; font-size: 12px; }
+.decision { font-size: 12px; color: var(--muted); margin: 4px 0; padding: 3px 8px; border-left: 2px solid #6b5a1e; }
+.decision.applied { border-left-color: #fbbf24; color: var(--text); }
+.decision.failed { border-left-color: var(--error); }
+
+/* ---------- model combobox (in-page list; native <select> popups choke on thousands of options) ---------- */
+.combo { position: relative; }
+.combo-menu {
+  position: absolute; z-index: 20; left: 0; right: 0; top: 38px;
+  max-height: 320px; overflow-y: auto;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
+.combo-group { padding: 6px 10px 2px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.combo-item { padding: 5px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.combo-item:hover, .combo-item.active { background: #24305a; }
+.combo-item.selected { color: var(--accent); }
+.combo-note { padding: 6px 10px; font-size: 12px; color: var(--muted); }
+
+.guard-warning { margin-top: 12px; padding: 8px 10px; border: 1px solid var(--queued); border-radius: 6px; font-size: 12.5px; color: var(--text); background: rgba(245, 158, 11, .08); }
+.team-updated { color: var(--accent); }
+.team-updated ul { margin: 2px 0 0; padding-left: 18px; color: var(--muted); }
+
+/* Fallbacks on usage limits */
+.fallback-box { margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.fallback-box summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.fallback-row { border-top: 1px dashed var(--border); padding: 8px 0 4px; margin-top: 6px; }
+.fallback-row .row { gap: 6px; flex-wrap: nowrap; }
+.fallback-row select { width: auto; flex: 1; min-width: 0; }
+.fallbacks > button { margin-top: 8px; }
+.fallback-line { font-size: 12.5px; margin: 8px 0; padding: 6px 10px; border-left: 3px solid var(--queued); background: var(--panel-2); border-radius: 4px; }

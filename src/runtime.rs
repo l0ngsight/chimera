@@ -46,6 +46,8 @@ pub struct Invocation<'a> {
     /// Native session to resume (`Some`) or to create (preassigned id for a fresh session).
     pub native_session: Option<&'a str>,
     pub resume: bool,
+    /// Process-guard sandbox to run the CLI in, when the guard is active.
+    pub wrapper: Option<crate::guard::Backend>,
 }
 
 /// Expands the argument templates for an invocation.
@@ -131,15 +133,29 @@ pub async fn run_process(
 ) -> TurnOutput {
     let spec = inv.spec;
     let (args, prompt_in_args) = build_args(&inv);
-    let _ = log.send(LogLine::new(LogKind::Command, describe_command(&spec.command, &args, inv.prompt)));
+    let mut shown = describe_command(&spec.command, &args, inv.prompt);
+    // Under the process guard the CLI runs inside an OS sandbox: `<wrapper> <command> <args…>`.
+    let guard = inv.wrapper.as_ref().filter(|_| spec.guard);
+    let (program, args) = match guard {
+        Some(b) => {
+            shown = format!("[process guard: {}] {shown}", b.name);
+            (b.program.clone(), b.args.iter().cloned().chain([spec.command.clone()]).chain(args).collect())
+        }
+        None => (spec.command.clone(), args),
+    };
+    let _ = log.send(LogLine::new(LogKind::Command, shown));
 
-    let mut cmd = Command::new(&spec.command);
+    let mut cmd = Command::new(&program);
     cmd.args(&args)
         .current_dir(inv.workdir)
         .stdin(if prompt_in_args { Stdio::null() } else { Stdio::piped() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    own_process_group(&mut cmd);
+    for var in guard.map(|b| b.hidden_env).unwrap_or_default() {
+        cmd.env_remove(var);
+    }
     for (k, v) in spec.env.iter().chain(inv.persona.env.iter()) {
         cmd.env(k, v);
     }
@@ -185,17 +201,23 @@ pub async fn run_process(
     let timeout = tokio::time::sleep(Duration::from_secs(spec.timeout_secs.max(1)));
     tokio::pin!(timeout);
 
+    let pgid = child.id();
     let mut aborted: Option<String> = None;
-    loop {
+    let mut status = None;
+    let mut stdout_open = true;
+    // The turn ends when the CLI exits. Processes it left running in the background (a dev
+    // server, a watcher) may keep stdout open forever, so we do not wait for end-of-file.
+    while status.is_none() {
         tokio::select! {
-            line = lines.next_line() => match line {
+            line = lines.next_line(), if stdout_open => match line {
                 Ok(Some(line)) => {
                     for l in parser.feed(&line) {
                         let _ = log.send(l);
                     }
                 }
-                _ => break,
+                _ => stdout_open = false,
             },
+            st = child.wait() => status = Some(st.ok()),
             _ = &mut timeout => {
                 aborted = Some(format!("timed out after {}s", spec.timeout_secs));
                 break;
@@ -208,13 +230,40 @@ pub async fn run_process(
             }
         }
     }
-
     if let Some(reason) = &aborted {
+        kill_process_group(pgid);
         let _ = child.start_kill();
         let _ = log.send(LogLine::new(LogKind::Error, format!("process {reason}")));
     }
-    let status = child.wait().await.ok();
-    let stderr_tail = stderr_task.await.unwrap_or_default();
+    // Read what the CLI wrote just before exiting. A process left in the background can keep
+    // the pipe open, so read briefly, stop the turn's whole process group (outside the process
+    // guard, which already does this), then read the rest (`next_line` is cancellation safe).
+    for (round, wait) in [Duration::from_secs(2), Duration::from_secs(2)].into_iter().enumerate() {
+        if round == 1 {
+            kill_process_group(pgid);
+        }
+        let until = tokio::time::Instant::now() + wait;
+        while stdout_open {
+            match tokio::time::timeout_at(until, lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    for l in parser.feed(&line) {
+                        let _ = log.send(l);
+                    }
+                }
+                Ok(_) => stdout_open = false,
+                Err(_) => break,
+            }
+        }
+    }
+    if stdout_open {
+        kill_process_group(pgid);
+    }
+    let status = match status {
+        Some(s) => s,
+        None => tokio::time::timeout(Duration::from_secs(5), child.wait()).await.ok().and_then(Result::ok),
+    };
+    let stderr_tail =
+        tokio::time::timeout(Duration::from_secs(2), stderr_task).await.ok().and_then(Result::ok).unwrap_or_default();
     let exit_code = status.and_then(|s| s.code());
 
     let mut out = parser.finish();
@@ -235,6 +284,39 @@ pub async fn run_process(
     out
 }
 
+/// Starts the agent in a process group of its own, so the whole group can be stopped at the end
+/// of the turn and a Ctrl+C in Chimera's terminal reaches Chimera only (which then stops the
+/// agents itself). On Linux the agent is also killed if Chimera dies without cleaning up.
+fn own_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe and touches only the calling (child) process.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+/// Kills the process group led by the agent CLI (the agent and anything it left running).
+fn kill_process_group(pgid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid.and_then(|p| libc::pid_t::try_from(p).ok()).filter(|p| *p > 1) {
+        // SAFETY: plain syscall; a group that no longer exists just returns ESRCH.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
 /// Incremental parser for a runtime's stdout.
 pub struct OutputParser {
     format: OutputFormat,
@@ -242,11 +324,13 @@ pub struct OutputParser {
     last_message: String,
     native_session: Option<String>,
     error: Option<String>,
+    /// Accumulated cost reported by the runtime (USD), when it reports one per message.
+    cost: f64,
 }
 
 impl OutputParser {
     pub fn new(format: OutputFormat) -> Self {
-        Self { format, text: String::new(), last_message: String::new(), native_session: None, error: None }
+        Self { format, text: String::new(), last_message: String::new(), native_session: None, error: None, cost: 0.0 }
     }
 
     pub fn feed(&mut self, line: &str) -> Vec<LogLine> {
@@ -265,6 +349,8 @@ impl OutputParser {
             OutputFormat::ClaudeStreamJson => self.feed_claude(&v),
             OutputFormat::CodexJson => self.feed_codex(&v),
             OutputFormat::OpencodeJson => self.feed_opencode(&v),
+            OutputFormat::PiJson => self.feed_pi(&v),
+            OutputFormat::CopilotJson => self.feed_copilot(&v),
             OutputFormat::Text => unreachable!(),
         }
     }
@@ -407,6 +493,142 @@ impl OutputParser {
         out
     }
 
+    /// pi `--mode json`: completed messages arrive in `message_end`, tool runs in
+    /// `tool_execution_*`; streaming `message_update` deltas are skipped.
+    fn feed_pi(&mut self, v: &Value) -> Vec<LogLine> {
+        let mut out = vec![];
+        match v["type"].as_str().unwrap_or_default() {
+            "session" => {
+                if let Some(id) = v["id"].as_str() {
+                    self.native_session = Some(id.to_string());
+                }
+                out.push(LogLine::new(LogKind::Info, "session started"));
+            }
+            "message_end" if v["message"]["role"] == "assistant" => {
+                let m = &v["message"];
+                let mut text = vec![];
+                for c in m["content"].as_array().into_iter().flatten() {
+                    match c["type"].as_str().unwrap_or_default() {
+                        "text" => text.push(c["text"].as_str().unwrap_or_default().to_string()),
+                        "thinking" => {
+                            let t = c["thinking"].as_str().unwrap_or_default();
+                            if !t.is_empty() {
+                                out.push(LogLine::new(LogKind::Thinking, t));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let text = text.join("\n");
+                if !text.trim().is_empty() {
+                    out.push(LogLine::new(LogKind::Text, text.clone()));
+                    self.last_message = text;
+                }
+                self.cost += m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0);
+                if m["stopReason"] == "error" {
+                    let msg = m["errorMessage"].as_str().unwrap_or("pi reported an error").to_string();
+                    out.push(LogLine::new(LogKind::Error, msg.clone()));
+                    self.error = Some(msg);
+                }
+            }
+            "tool_execution_start" => out.push(LogLine::new(
+                LogKind::Tool,
+                format!("{} {}", v["toolName"].as_str().unwrap_or("tool"), summarize_json(&v["args"])),
+            )),
+            "tool_execution_end" => {
+                let body: Vec<&str> = v["result"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| c["text"].as_str())
+                    .collect();
+                let kind = if v["isError"] == true { LogKind::Error } else { LogKind::ToolResult };
+                out.push(LogLine::new(kind, truncate(&body.join("\n"), 2000)));
+            }
+            "auto_retry_start" => out.push(LogLine::new(
+                LogKind::Info,
+                format!("retrying ({})", v["errorMessage"].as_str().unwrap_or("provider error")),
+            )),
+            "auto_retry_end" if v["success"] == false => {
+                let msg = v["finalError"].as_str().unwrap_or("pi gave up after retries").to_string();
+                out.push(LogLine::new(LogKind::Error, msg.clone()));
+                self.error = Some(msg);
+            }
+            "agent_settled" => {
+                let cost = if self.cost > 0.0 { format!(", cost ${:.4}", self.cost) } else { String::new() };
+                let how = if v["aborted"] == true { "aborted" } else { "finished" };
+                out.push(LogLine::new(LogKind::Info, format!("{how}{cost}")));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// GitHub Copilot CLI `--output-format json`: one session event per line (`{type, data, …}`,
+    /// see `session-events.schema.json` in `@github/copilot-sdk`). Streaming deltas are skipped.
+    /// Every top-level assistant message is part of the reply, so `<message>` blocks written
+    /// before a closing remark are not lost.
+    fn feed_copilot(&mut self, v: &Value) -> Vec<LogLine> {
+        let mut out = vec![];
+        let d = &v["data"];
+        let nested = d["parentToolCallId"].is_string(); // a subagent's events
+        match v["type"].as_str().unwrap_or_default() {
+            "session.start" => {
+                if let Some(id) = d["sessionId"].as_str() {
+                    self.native_session = Some(id.to_string());
+                }
+                out.push(LogLine::new(LogKind::Info, "session started"));
+            }
+            "assistant.message" if !nested => {
+                let t = d["content"].as_str().unwrap_or_default();
+                if !t.trim().is_empty() {
+                    out.push(LogLine::new(LogKind::Text, t));
+                    if !self.text.is_empty() {
+                        self.text.push_str("\n\n");
+                    }
+                    self.text.push_str(t);
+                    self.last_message = t.to_string();
+                }
+            }
+            "assistant.reasoning" if !nested => {
+                let t = d["content"].as_str().unwrap_or_default();
+                if !t.trim().is_empty() {
+                    out.push(LogLine::new(LogKind::Thinking, t));
+                }
+            }
+            "tool.execution_start" => {
+                let name = d["toolTitle"].as_str().or(d["toolName"].as_str()).unwrap_or("tool");
+                out.push(LogLine::new(LogKind::Tool, format!("{name} {}", summarize_json(&d["arguments"]))));
+            }
+            "tool.execution_complete" => {
+                let (kind, body) = if d["success"] == false {
+                    (LogKind::Error, d["error"]["message"].as_str().unwrap_or("tool failed"))
+                } else {
+                    (LogKind::ToolResult, d["result"]["content"].as_str().unwrap_or_default())
+                };
+                if !body.trim().is_empty() {
+                    out.push(LogLine::new(kind, truncate(body, 2000)));
+                }
+            }
+            "assistant.usage" => self.cost += d["cost"].as_f64().unwrap_or(0.0),
+            "model.call_failure" => out.push(LogLine::new(
+                LogKind::Info,
+                format!("model call failed ({}), retrying", d["errorMessage"].as_str().unwrap_or("provider error")),
+            )),
+            "session.warning" => out.push(LogLine::new(LogKind::Info, d["message"].as_str().unwrap_or_default())),
+            // e.g. errorType "rate_limit" / errorCode "user_weekly_rate_limited", or "quota".
+            "session.error" => {
+                let kind = [d["errorType"].as_str(), d["errorCode"].as_str()].into_iter().flatten().collect::<Vec<_>>();
+                let msg = d["message"].as_str().unwrap_or("copilot reported an error");
+                let msg = if kind.is_empty() { msg.to_string() } else { format!("{msg} [{}]", kind.join("/")) };
+                out.push(LogLine::new(LogKind::Error, msg.clone()));
+                self.error = Some(msg);
+            }
+            _ => {}
+        }
+        out
+    }
+
     fn feed_opencode(&mut self, v: &Value) -> Vec<LogLine> {
         let part = &v["part"];
         match v["type"].as_str().unwrap_or_default() {
@@ -484,8 +706,59 @@ mod tests {
             prompt: String::new(),
             extra_args: vec!["--foo".into()],
             env: Default::default(),
+            fallbacks: vec![],
             position: None,
         }
+    }
+
+    #[test]
+    fn agents_are_kept_away_from_the_users_programs() {
+        let rts = builtin_runtimes();
+        let p = persona("opus", Effort::High);
+        for resume in [false, true] {
+            let inv = Invocation {
+                spec: &rts["claude"],
+                persona: &p,
+                prompt: "hi",
+                workdir: Path::new("/tmp"),
+                native_session: Some("s"),
+                resume,
+                wrapper: None,
+            };
+            let (args, _) = build_args(&inv);
+            assert!(args.contains(&"--no-chrome".to_string()), "resume={resume}");
+            let denied = args.windows(2).find(|w| w[0] == "--disallowedTools").map(|w| w[1].clone());
+            assert!(denied.is_some_and(|d| d.contains("Bash(pkill *)") && d.contains("Bash(xargs kill *)")));
+        }
+        let inv = Invocation {
+            spec: &rts["codex"],
+            persona: &p,
+            prompt: "hi",
+            workdir: Path::new("/tmp"),
+            native_session: None,
+            resume: false,
+            wrapper: None,
+        };
+        let (args, _) = build_args(&inv);
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
+        assert!(!args.iter().any(|a| a.contains("dangerously")));
+        let p = persona("gpt-5.3-codex", Effort::Ultra);
+        let inv = Invocation {
+            spec: &rts["copilot"],
+            persona: &p,
+            prompt: "hi",
+            workdir: Path::new("/tmp"),
+            native_session: Some("0cb916db-26aa-40f2-86b5-1ba81b225fd2"),
+            resume: true,
+            wrapper: None,
+        };
+        let (args, prompt_in_args) = build_args(&inv);
+        assert!(!prompt_in_args, "the prompt goes to stdin");
+        assert!(args.windows(2).any(|w| w == ["--model", "gpt-5.3-codex"]));
+        assert!(args.windows(2).any(|w| w == ["--reasoning-effort", "max"]));
+        assert!(args.windows(2).any(|w| w == ["--session-id", "0cb916db-26aa-40f2-86b5-1ba81b225fd2"]));
+        assert!(args.contains(&"--deny-tool=shell(pkill)".to_string()));
+        assert!(args.contains(&"--no-ask-user".to_string()));
     }
 
     #[test]
@@ -499,6 +772,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: None,
             resume: false,
+            wrapper: None,
         };
         let (args, in_args) = build_args(&inv);
         assert!(!in_args);
@@ -519,6 +793,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: Some("abc"),
             resume: true,
+            wrapper: None,
         };
         let (args, _) = build_args(&inv);
         assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
@@ -536,10 +811,12 @@ mod tests {
             workdir: Path::new("/tmp"),
             native_session: None,
             resume: false,
+            wrapper: None,
         };
         let (args, in_args) = build_args(&inv);
         assert!(in_args);
         assert!(args.contains(&"do it".to_string()));
+        assert!(args.contains(&"--auto".to_string()), "opencode must not auto-reject permissions");
         assert!(describe_command("opencode", &args, "do it").contains("<prompt>"));
     }
 
@@ -553,6 +830,62 @@ mod tests {
         let out = p.finish();
         assert_eq!(out.text, "all done");
         assert_eq!(out.native_session.as_deref(), Some("s1"));
+    }
+
+    /// Real `pi -p --mode json` output: a bash tool call, its result, then the final answer.
+    #[test]
+    fn parses_pi_json() {
+        let mut p = OutputParser::new(OutputFormat::PiJson);
+        let mut lines = vec![];
+        for l in include_str!("../testdata/pi-json.jsonl").lines() {
+            lines.extend(p.feed(l));
+        }
+        assert!(lines.iter().any(|l| l.kind == LogKind::Tool && l.text == "bash echo tool-ran-ok"));
+        assert!(lines.iter().any(|l| l.kind == LogKind::ToolResult && l.text.trim() == "tool-ran-ok"));
+        assert!(lines.iter().any(|l| l.kind == LogKind::Info && l.text.starts_with("finished")));
+        let out = p.finish();
+        assert_eq!(out.text, "Done. <message to=\"lead\">result ready</message>");
+        assert_eq!(out.native_session.as_deref(), Some("bc66e7da-dfaa-4677-852a-1535c50f75fe"));
+        assert!(out.error.is_none());
+    }
+
+    /// Events follow the Copilot SDK's `session-events.schema.json` (hand-written sample).
+    #[test]
+    fn parses_copilot_json() {
+        let mut p = OutputParser::new(OutputFormat::CopilotJson);
+        let mut logs = vec![];
+        for l in include_str!("../testdata/copilot-json.jsonl").lines() {
+            logs.extend(p.feed(l));
+        }
+        let kinds: Vec<LogKind> = logs.iter().map(|l| l.kind).collect();
+        assert!(kinds.contains(&LogKind::Thinking));
+        assert!(logs.iter().any(|l| l.kind == LogKind::Tool && l.text.contains("cargo test")));
+        assert!(logs.iter().any(|l| l.kind == LogKind::ToolResult && l.text.contains("12 passed")));
+        assert!(logs.iter().any(|l| l.kind == LogKind::Error && l.text.contains("pkill")));
+        let out = p.finish();
+        assert!(out.error.is_none());
+        assert_eq!(out.native_session.as_deref(), Some("0cb916db-26aa-40f2-86b5-1ba81b225fd2"));
+        assert!(out.text.starts_with("I'll add the endpoint."));
+        assert!(!out.text.contains("subagent chatter"));
+        let d = crate::orchestrator::parse_directives(&out.text);
+        assert_eq!(d.messages, vec![("qa".to_string(), "POST /links is ready, tests pass.".to_string())]);
+    }
+
+    #[test]
+    fn copilot_limits_switch_to_fallbacks() {
+        let mut p = OutputParser::new(OutputFormat::CopilotJson);
+        p.feed(r#"{"type":"session.error","data":{"errorType":"rate_limit","errorCode":"user_weekly_rate_limited","message":"You've reached your weekly rate limit for gpt-5.4. Try again in 2 days 3 hours."}}"#);
+        let out = p.finish();
+        let spec = &crate::config::builtin_runtimes()["copilot"];
+        let reason = crate::limits::detect(spec, &out).expect("recognised as a limit");
+        assert!(reason.contains("user_weekly_rate_limited"));
+    }
+
+    #[test]
+    fn pi_errors_are_reported() {
+        let mut p = OutputParser::new(OutputFormat::PiJson);
+        p.feed(r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401 invalid key"}}"#);
+        assert_eq!(p.finish().error.as_deref(), Some("401 invalid key"));
     }
 
     #[test]
@@ -582,6 +915,7 @@ mod tests {
                 workdir: Path::new("."),
                 native_session: None,
                 resume: false,
+                wrapper: None,
             },
             tx,
             crx,
@@ -590,5 +924,42 @@ mod tests {
         assert_eq!(out.text, "hello\nworld");
         assert!(out.error.is_none());
         assert_eq!(rx.recv().await.unwrap().kind, LogKind::Command);
+    }
+
+    #[tokio::test]
+    async fn guarded_runtimes_run_inside_the_wrapper() {
+        // `env CMD ARGS…` behaves like a pass-through sandbox, so the wrapping is observable on any OS.
+        let mut spec = builtin_runtimes()["hermes"].clone();
+        spec.command = "cat".into();
+        spec.args = vec![];
+        let p = Persona { extra_args: vec![], ..persona("", Effort::Medium) };
+        for (guard, expect_prefix) in [(true, true), (false, false)] {
+            spec.guard = guard;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (_ctx, crx) = watch::channel(false);
+            let out = run_process(
+                Invocation {
+                    spec: &spec,
+                    persona: &p,
+                    prompt: "guarded",
+                    workdir: Path::new("."),
+                    native_session: None,
+                    resume: false,
+                    wrapper: Some(crate::guard::Backend {
+                        name: "env",
+                        program: "env".into(),
+                        args: vec![],
+                        hidden_env: &[],
+                        covers: "test",
+                    }),
+                },
+                tx,
+                crx,
+            )
+            .await;
+            assert_eq!(out.text, "guarded");
+            let cmd = rx.recv().await.unwrap().text;
+            assert_eq!(cmd.starts_with("[process guard: env]"), expect_prefix, "{cmd}");
+        }
     }
 }

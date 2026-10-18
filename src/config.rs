@@ -15,6 +15,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub prompt_llm: PromptLlmConfig,
+    /// Quick orchestration decisions with Jev.
+    #[serde(default)]
+    pub decisions: crate::decisions::DecisionsConfig,
     /// Runtime definitions keyed by name. Merged over the built-in defaults.
     #[serde(default)]
     pub runtimes: BTreeMap<String, RuntimeSpec>,
@@ -103,9 +106,47 @@ pub struct RuntimeSpec {
     /// Kill the process after this many seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Model suggestions for the UI.
+    /// Run under the process guard (OS sandbox that blocks killing/quitting outside programs).
+    /// Off for CLIs that apply their own macOS sandbox, which cannot be nested.
+    #[serde(default = "default_true")]
+    pub guard: bool,
+    /// Case-insensitive phrases that mark a failed turn as a usage/rate limit, which switches
+    /// the persona to its next fallback (see `Persona::fallbacks`).
+    #[serde(default = "default_limit_patterns")]
+    pub limit_patterns: Vec<String>,
+    /// Where the persona editor gets this runtime's model list from.
+    #[serde(default)]
+    pub models_source: ModelsSource,
+    /// Model suggestions for the UI (also the fallback when `models_source` fails).
     #[serde(default)]
     pub models: Vec<String>,
+}
+
+/// Phrases Claude Code, Codex, opencode and pi print when a plan, session or rate limit is hit,
+/// e.g. "Usage limit reached · limit resets 3pm", "You've hit your usage limit. Try again in 4 days",
+/// "Quota exceeded", "429 Too Many Requests", "Credit balance is too low".
+pub const DEFAULT_LIMIT_PATTERNS: &[&str] = &[
+    "usage limit",
+    "limit reached",
+    "hit your limit",
+    "out of extra usage",
+    "rate limit",
+    "rate_limit",
+    "quota",
+    "too many requests",
+    "429",
+    "credit balance",
+    "out of credits",
+    "insufficient credits",
+    "insufficient_quota",
+];
+
+pub fn default_limit_patterns() -> Vec<String> {
+    DEFAULT_LIMIT_PATTERNS.iter().map(|s| s.to_string()).collect()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_timeout() -> u64 {
@@ -151,6 +192,51 @@ pub enum OutputFormat {
     CodexJson,
     /// `opencode run --format json`.
     OpencodeJson,
+    /// `pi -p --mode json` (JSONL session events).
+    PiJson,
+    /// `copilot --output-format json` (GitHub Copilot CLI session events, JSONL).
+    CopilotJson,
+}
+
+/// How to discover the models a runtime can use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModelsSource {
+    /// Only the `models` suggestions.
+    #[default]
+    Static,
+    /// Run `command` with these arguments and parse its stdout.
+    Command {
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        format: ModelsFormat,
+    },
+    /// Anthropic Models API (Claude Code itself cannot list models).
+    AnthropicApi {
+        #[serde(default = "default_anthropic_key_env")]
+        api_key_env: String,
+    },
+}
+
+fn default_anthropic_key_env() -> String {
+    "ANTHROPIC_API_KEY".into()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelsFormat {
+    /// One model id per line.
+    #[default]
+    Lines,
+    /// `codex debug models` JSON.
+    CodexCatalog,
+    /// `opencode models --verbose`.
+    OpencodeVerbose,
+    /// `pi --list-models` (table: provider, model, context, max-out, thinking, images).
+    PiTable,
+    /// The `model` choices listed by `copilot help config`.
+    CopilotConfig,
 }
 
 fn one(s: &str) -> ArgItem {
@@ -160,6 +246,23 @@ fn one(s: &str) -> ArgItem {
 fn group(items: &[&str]) -> ArgItem {
     ArgItem::Group(items.iter().map(|s| s.to_string()).collect())
 }
+
+/// Shell commands Claude agents may not run: they can take down programs the user is running
+/// (`pkill chrome`, `lsof -ti:PORT | xargs kill`, AppleScript `quit`). Deny rules hold even with
+/// `bypassPermissions`, including inside pipes and `&&` chains.
+pub const CLAUDE_DENIED_TOOLS: &str =
+    "Bash(pkill *),Bash(killall *),Bash(kill *),Bash(xargs kill *),Bash(osascript *),Bash(shutdown *),Bash(reboot *)";
+
+/// The same protection for GitHub Copilot CLI agents (`--deny-tool` wins over `--allow-all-tools`).
+const COPILOT_DENIED_TOOLS: &[&str] = &[
+    "--deny-tool=shell(pkill)",
+    "--deny-tool=shell(killall)",
+    "--deny-tool=shell(kill)",
+    "--deny-tool=shell(xargs kill)",
+    "--deny-tool=shell(osascript)",
+    "--deny-tool=shell(shutdown)",
+    "--deny-tool=shell(reboot)",
+];
 
 /// Built-in runtime definitions. Users can override any of them in `chimera.yaml`.
 pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
@@ -180,6 +283,11 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 one("--verbose"),
                 one("--permission-mode"),
                 one("bypassPermissions"),
+                // Unattended agents must never drive the user's real browser.
+                one("--no-chrome"),
+                // ...nor kill or quit programs they did not start (enforced even in bypass mode).
+                one("--disallowedTools"),
+                one(CLAUDE_DENIED_TOOLS),
             ],
             resume_args: Some(vec![
                 one("-p"),
@@ -191,12 +299,20 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 one("--verbose"),
                 one("--permission-mode"),
                 one("bypassPermissions"),
+                // Unattended agents must never drive the user's real browser.
+                one("--no-chrome"),
+                // ...nor kill or quit programs they did not start (enforced even in bypass mode).
+                one("--disallowedTools"),
+                one(CLAUDE_DENIED_TOOLS),
             ]),
             session: SessionMode::Preassign,
             output: OutputFormat::ClaudeStreamJson,
-            effort_map: BTreeMap::from([("minimal".into(), "low".into())]),
+            effort_map: BTreeMap::from([("minimal".into(), "low".into()), ("ultra".into(), "max".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            guard: true,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::AnthropicApi { api_key_env: default_anthropic_key_env() },
             models: vec!["opus".into(), "sonnet".into(), "haiku".into(), "fable".into()],
         },
     );
@@ -212,16 +328,30 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
                 group(&["-c", "model_reasoning_effort=\"{effort}\""]),
                 one("--json"),
                 one("--skip-git-repo-check"),
-                one("--dangerously-bypass-approvals-and-sandbox"),
+                // Sandboxed: writes confined to the workspace, network allowed for installs/tests.
+                one("--sandbox"),
+                one("workspace-write"),
+                one("-c"),
+                one("sandbox_workspace_write.network_access=true"),
+                one("-c"),
+                one("approval_policy=\"never\""),
                 one("-"),
             ],
             resume_args: None,
             session: SessionMode::None,
             output: OutputFormat::CodexJson,
-            effort_map: BTreeMap::from([("max".into(), "xhigh".into())]),
+            effort_map: BTreeMap::from([("minimal".into(), "low".into())]),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
-            models: vec!["gpt-5.6-sol".into(), "gpt-5.5".into(), "gpt-5.5-codex".into()],
+            // On macOS Codex applies its own seatbelt sandbox (which already blocks outside
+            // signals) and seatbelt sandboxes cannot be nested. On Linux nesting works.
+            guard: !cfg!(target_os = "macos"),
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Command {
+                args: vec!["debug".into(), "models".into()],
+                format: ModelsFormat::CodexCatalog,
+            },
+            models: vec!["gpt-5.6-sol".into(), "gpt-5.5".into()],
         },
     );
     m.insert(
@@ -232,6 +362,9 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             command: "opencode".into(),
             args: vec![
                 one("run"),
+                // Unattended: without --auto, opencode auto-rejects every "ask" permission (e.g.
+                // `external_directory` for /tmp) and the agent gets stuck. Explicit denies still apply.
+                one("--auto"),
                 group(&["--model", "{model}"]),
                 group(&["--variant", "{effort}"]),
                 one("--format"),
@@ -244,6 +377,12 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            guard: true,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Command {
+                args: vec!["models".into(), "--verbose".into()],
+                format: ModelsFormat::OpencodeVerbose,
+            },
             models: vec![
                 "deepseek/deepseek-v4-flash".into(),
                 "deepseek/deepseek-v4-pro".into(),
@@ -264,7 +403,84 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: default_timeout(),
+            guard: true,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Static,
             models: vec!["anthropic/claude-opus-5-5".into(), "nousresearch/hermes-4-405b".into()],
+        },
+    );
+    m.insert(
+        "copilot".into(),
+        RuntimeSpec {
+            label: "GitHub Copilot CLI".into(),
+            kind: RuntimeKind::Process,
+            command: "copilot".into(),
+            // Prompt on stdin (non-interactive run). The same --session-id creates the session on
+            // the first turn and continues it afterwards.
+            args: [
+                vec![
+                    group(&["--model", "{model}"]),
+                    group(&["--reasoning-effort", "{effort}"]),
+                    group(&["--session-id", "{native_session}"]),
+                    one("--output-format"),
+                    one("json"),
+                    // Unattended: approve tool use, never stop to ask the user a question.
+                    one("--allow-all-tools"),
+                    one("--no-ask-user"),
+                    one("--no-auto-update"),
+                    one("--no-color"),
+                ],
+                COPILOT_DENIED_TOOLS.iter().map(|d| one(d)).collect(),
+            ]
+            .concat(),
+            resume_args: None,
+            session: SessionMode::Preassign,
+            output: OutputFormat::CopilotJson,
+            effort_map: BTreeMap::from([("ultra".into(), "max".into())]),
+            env: BTreeMap::new(),
+            timeout_secs: default_timeout(),
+            guard: true,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Command {
+                args: vec!["help".into(), "config".into()],
+                format: ModelsFormat::CopilotConfig,
+            },
+            models: vec![
+                "claude-sonnet-5".into(),
+                "gpt-5.6-luna".into(),
+                "gpt-5.4".into(),
+                "gpt-5.4-mini".into(),
+                "gpt-5.3-codex".into(),
+                "gpt-5-mini".into(),
+            ],
+        },
+    );
+    m.insert(
+        "pi".into(),
+        RuntimeSpec {
+            label: "pi coding agent".into(),
+            kind: RuntimeKind::Process,
+            command: "pi".into(),
+            // Prompt on stdin. The same --session-id creates the session on the first turn and
+            // continues it afterwards, so no separate resume arguments are needed.
+            args: vec![
+                one("-p"),
+                one("--mode"),
+                one("json"),
+                group(&["--model", "{model}"]),
+                group(&["--thinking", "{effort}"]),
+                group(&["--session-id", "{native_session}"]),
+            ],
+            resume_args: None,
+            session: SessionMode::Preassign,
+            output: OutputFormat::PiJson,
+            effort_map: BTreeMap::from([("ultra".into(), "max".into())]),
+            env: BTreeMap::new(),
+            timeout_secs: default_timeout(),
+            guard: true,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Command { args: vec!["--list-models".into()], format: ModelsFormat::PiTable },
+            models: vec!["anthropic/claude-sonnet-5-5".into(), "openai/gpt-5.5".into()],
         },
     );
     m.insert(
@@ -280,6 +496,9 @@ pub fn builtin_runtimes() -> BTreeMap<String, RuntimeSpec> {
             effort_map: BTreeMap::new(),
             env: BTreeMap::new(),
             timeout_secs: 60,
+            guard: false,
+            limit_patterns: default_limit_patterns(),
+            models_source: ModelsSource::Static,
             models: vec!["mock".into()],
         },
     );
@@ -292,6 +511,7 @@ impl Default for Config {
             bind: default_bind(),
             data_dir: default_data_dir(),
             prompt_llm: PromptLlmConfig::default(),
+            decisions: Default::default(),
             runtimes: builtin_runtimes(),
         }
     }
@@ -323,6 +543,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn example_config_parses() {
+        let cfg: Config = serde_yaml::from_str(include_str!("../chimera.example.yaml")).unwrap();
+        assert_eq!(cfg.decisions.model, "jev-latest");
+        assert!(cfg.runtimes.contains_key("hermes"));
+    }
 
     #[test]
     fn user_runtimes_override_builtins() {

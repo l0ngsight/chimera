@@ -14,6 +14,10 @@ personas:
     runtime: claude
     model: opus
     effort: medium
+    # Used in order when Claude Code reports a usage/session limit; back to opus once it resets.
+    fallbacks:
+      - {runtime: claude, model: sonnet, effort: high}
+      - {runtime: codex, model: gpt-5.5, effort: high}
     position: { x: 460, y: 80 }
     prompt: |
       You are Dana, a pragmatic engineering lead who has shipped many production systems.
@@ -65,6 +69,8 @@ personas:
     runtime: claude
     model: sonnet
     effort: high
+    fallbacks:
+      - {runtime: codex, model: gpt-5.5, effort: high}
     position: { x: 260, y: 290 }
     prompt: |
       You are Ben, a senior backend engineer. You implement services, APIs, persistence and
@@ -85,6 +91,8 @@ personas:
     runtime: codex
     model: gpt-5.6-sol
     effort: high
+    fallbacks:
+      - {runtime: claude, model: sonnet, effort: high}
     position: { x: 660, y: 290 }
     prompt: |
       You are Fiona, a senior frontend engineer with a strong eye for UX and accessibility.

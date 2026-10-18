@@ -13,6 +13,29 @@ prompt_llm:
   api_key_env: DEEPSEEK_API_KEY   # name of the env var; the key is never written to disk
   temperature: 0.7
 
+# Quick orchestration decisions with Jev (TypeSafe's decision model), also editable under Settings.
+# Every decision is optional: if Jev is disabled, has no key, or fails, chimera behaves as without it.
+decisions:
+  enabled: true
+  # OpenRouter's System One API (default). For TypeSafe directly use https://api.typesafe.ai/v1.
+  base_url: https://openrouter.ai/api/v1 # requests go to {base_url}/systemone
+  model: jev-latest                      # OpenRouter maps it to ~typesafe/jev-latest; pin e.g. jev-1.13
+  api_key_env: JEV_API_KEY               # your OpenRouter key; falls back to OPENROUTER_API_KEY, TYPESAFE_API_KEY
+  timeout_ms: 5000
+  ack_filter: true             # don't wake a persona for "thanks / sounds good" messages
+  ack_min_confidence: 0.6
+  resolve_recipients: true     # re-address <message to="backend_engineer"> to the intended teammate
+  resolve_min_confidence: 0.5
+  detect_final: true           # complete when the entry persona is done but forgot <final>
+  final_threshold: 0.9
+  route_user_messages: true    # "Auto" recipient for user follow-ups
+  route_min_confidence: 0.4
+  # Optional: let Jev pick each turn's reasoning effort (never above the persona's configured effort
+  # unless effort_can_raise allows one level more).
+  advise_effort: false
+  effort_min_confidence: 0.5
+  effort_can_raise: false
+
 # Runtime definitions. Argument templates support {model} {effort} {prompt} {workdir} {native_session}.
 # A nested list is a group that is dropped when any placeholder in it is empty.
 # Without {prompt} in the args, the prompt is written to stdin.
@@ -23,6 +46,9 @@ runtimes:
     command: hermes
     args: [chat, ["--provider", "openrouter"], ["--model", "{model}"], -q, "{prompt}"]
     output: text
+    # Model list for the persona editor. Hermes only has an interactive picker, so the default is
+    # the static `models` list; any command that prints one model id per line works instead:
+    # models_source: { kind: command, args: [...], format: lines }
     models: [anthropic/claude-opus-5-5, nousresearch/hermes-4-405b]
 
   # Example: opencode without the reasoning-effort variant flag (for older opencode versions).
@@ -37,9 +63,26 @@ runtimes:
   #   session: capture            # thread id is read from the `thread.started` event
   #   output: codex-json
   #   args: [exec, ["--model", "{model}"], ["-c", "model_reasoning_effort=\"{effort}\""], --json,
-  #          --skip-git-repo-check, --dangerously-bypass-approvals-and-sandbox, "-"]
+  #          --sandbox, workspace-write, -c, sandbox_workspace_write.network_access=true, --skip-git-repo-check, "-"]
   #   resume_args: [exec, ["--model", "{model}"], --json, --skip-git-repo-check,
-  #                 --dangerously-bypass-approvals-and-sandbox, resume, "{native_session}", "-"]
+  #                 --sandbox, workspace-write, resume, "{native_session}", "-"]
+
+  # Example: GitHub Copilot CLI offering only an approved model set in the persona editor (by
+  # default the list comes from `copilot help config`). An entry here replaces the built-in
+  # definition, so it repeats the built-in arguments.
+  # copilot:
+  #   label: GitHub Copilot CLI
+  #   command: copilot
+  #   args: [["--model", "{model}"], ["--reasoning-effort", "{effort}"], ["--session-id", "{native_session}"],
+  #          --output-format, json, --allow-all-tools, --no-ask-user, --no-auto-update, --no-color,
+  #          "--deny-tool=shell(pkill)", "--deny-tool=shell(killall)", "--deny-tool=shell(kill)",
+  #          "--deny-tool=shell(xargs kill)", "--deny-tool=shell(osascript)",
+  #          "--deny-tool=shell(shutdown)", "--deny-tool=shell(reboot)"]
+  #   session: preassign
+  #   output: copilot-json
+  #   effort_map: { ultra: max }
+  #   models_source: { kind: static }
+  #   models: [claude-sonnet-5, gpt-5.6-luna, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5-mini]
 
   # Example: any other CLI that prints its answer on stdout.
   # aider:

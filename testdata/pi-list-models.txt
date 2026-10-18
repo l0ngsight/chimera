@@ -1,0 +1,5 @@
+provider        model                                             context  max-out  thinking  images
+amazon-bedrock  amazon.nova-2-lite-v1:0                           1M       65.5K    yes       yes   
+amazon-bedrock  amazon.nova-lite-v1:0                             300K     10K      no        yes   
+amazon-bedrock  amazon.nova-micro-v1:0                            128K     10K      no        no    
+fake            fake-1                                            128K     16.4K    no        no    
