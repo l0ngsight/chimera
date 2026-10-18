@@ -14,8 +14,17 @@ use crate::model::Team;
 /// when a new sample ships); `.samples` remembers which were offered, so deleting one sticks.
 pub const SAMPLE_TEAMS: &[(&str, &str)] = &[
     ("software-dev", include_str!("../teams/software-dev.yaml")),
-    ("scb-software-engineering", include_str!("../teams/scb-software-engineering.yaml")),
+    ("copilot-engineering-team", include_str!("../teams/copilot-engineering-team.yaml")),
 ];
+
+/// Sample teams that were renamed: (old id, new id, old name, new name). An install that has the
+/// old sample gets its copy moved to the new id, edits included, instead of a second copy.
+const RENAMED_SAMPLES: &[(&str, &str, &str, &str)] = &[(
+    "scb-software-engineering",
+    "copilot-engineering-team",
+    "SCB Software Engineering Team",
+    "Copilot Engineering Team",
+)];
 
 pub struct TeamStore {
     dir: PathBuf,
@@ -34,6 +43,23 @@ impl TeamStore {
             Err(_) => vec![],
         };
         let mut changed = false;
+        for (old, new, old_name, new_name) in RENAMED_SAMPLES {
+            if !offered.iter().any(|o| o == old) || offered.iter().any(|o| o == new) {
+                continue;
+            }
+            if let Ok(Some(mut team)) = store.get(old)
+                && !store.path(new).exists()
+            {
+                team.id = new.to_string();
+                if team.name == *old_name {
+                    team.name = new_name.to_string();
+                }
+                store.save(&team)?;
+                std::fs::remove_file(store.path(old))?;
+            }
+            offered.push(new.to_string());
+            changed = true;
+        }
         for (id, yaml) in SAMPLE_TEAMS {
             if offered.iter().any(|o| o == id) {
                 continue;
@@ -184,12 +210,12 @@ mod tests {
         }
     }
 
-    /// The SCB team may only use Copilot CLI and the bank's approved models.
+    /// The Copilot team may only use Copilot CLI and its approved models.
     #[test]
-    fn scb_team_uses_only_approved_copilot_models() {
+    fn copilot_team_uses_only_approved_copilot_models() {
         const APPROVED: &[&str] =
             &["claude-sonnet-5", "gpt-5-mini", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.6-luna"];
-        let (_, yaml) = super::SAMPLE_TEAMS.iter().find(|(id, _)| *id == "scb-software-engineering").unwrap();
+        let (_, yaml) = super::SAMPLE_TEAMS.iter().find(|(id, _)| *id == "copilot-engineering-team").unwrap();
         let team: crate::model::Team = serde_yaml::from_str(yaml).unwrap();
         for p in &team.personas {
             for c in p.at_levels() {
@@ -200,15 +226,39 @@ mod tests {
     }
 
     #[test]
+    fn renamed_sample_teams_keep_the_users_copy() {
+        let dir = std::env::temp_dir().join(format!("chimera-teams-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // An install that was given the SCB sample and edited it.
+        std::fs::write(dir.join(".samples"), "software-dev\nscb-software-engineering\n").unwrap();
+        let (_, yaml) = super::SAMPLE_TEAMS.iter().find(|(id, _)| *id == "copilot-engineering-team").unwrap();
+        let old = yaml
+            .replacen("id: copilot-engineering-team", "id: scb-software-engineering", 1)
+            .replacen("name: Copilot Engineering Team", "name: SCB Software Engineering Team", 1)
+            .replacen("max_parallel: 3", "max_parallel: 2", 1);
+        std::fs::write(dir.join("scb-software-engineering.yaml"), old).unwrap();
+
+        let store = super::TeamStore::open(dir.clone()).unwrap();
+        let teams = store.list().unwrap();
+        assert_eq!(teams.len(), 1, "no duplicate: {:?}", teams.iter().map(|t| &t.id).collect::<Vec<_>>());
+        assert_eq!(teams[0].id, "copilot-engineering-team");
+        assert_eq!(teams[0].name, "Copilot Engineering Team");
+        assert_eq!(teams[0].max_parallel, 2, "the user's edit is kept");
+        assert!(!dir.join("scb-software-engineering.yaml").exists());
+        // Stable on the next start.
+        assert_eq!(super::TeamStore::open(dir).unwrap().list().unwrap().len(), 1);
+    }
+
+    #[test]
     fn new_sample_teams_reach_existing_installs_once() {
         let dir = std::env::temp_dir().join(format!("chimera-teams-{}", uuid::Uuid::new_v4()));
         // An install from before `.samples` existed, whose user deleted the first sample.
         std::fs::create_dir_all(&dir).unwrap();
         let store = super::TeamStore::open(dir.clone()).unwrap();
         let ids: Vec<String> = store.list().unwrap().into_iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec!["scb-software-engineering"]);
+        assert_eq!(ids, vec!["copilot-engineering-team"]);
         // Deleting a sample sticks across restarts.
-        std::fs::remove_file(dir.join("scb-software-engineering.yaml")).unwrap();
+        std::fs::remove_file(dir.join("copilot-engineering-team.yaml")).unwrap();
         assert!(super::TeamStore::open(dir.clone()).unwrap().list().unwrap().is_empty());
         // A fresh install gets every sample.
         let fresh = dir.join("fresh");

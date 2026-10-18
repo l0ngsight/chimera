@@ -24,10 +24,8 @@ falls back to compiling when it can't.
 1. **Crate name: decided, `chimera-ai`.** `chimera` belongs to an unrelated crate. The package is
    renamed and a `[[bin]]` section keeps the command as `chimera`, so `cargo install chimera-ai`
    installs `chimera`. The name is not reserved until the first `cargo publish`.
-2. **Sample teams in a public release.** `teams/scb-software-engineering.yaml` names SCB and its
-   approved Copilot model set. Before publishing, decide whether that belongs in a public crate.
-   Options: publish it as is, rename it to a generic "Copilot-only enterprise team", or drop it from
-   `SAMPLE_TEAMS` and `include`.
+2. **Sample teams in a public release: decided.** The Copilot-only team is published as the generic
+   `copilot-engineering-team` sample.
 3. **Copyright holder** in `LICENSE`. It currently reads "l0ngsight"; change it if the work should be
    credited to a person or an organisation.
 4. **Supported platforms.** Linux and macOS are tested. Windows is untested: agents and tests rely
@@ -88,7 +86,6 @@ same from a laptop.
 
 ## 4. Before the first release
 
-- [ ] Decide what happens to the SCB sample team (decision 2).
 - [ ] Add a "Install" section to the README: `cargo install chimera-ai`, `cargo binstall chimera-ai`,
       release downloads, and the prerequisites (the agent CLIs themselves, optional `bwrap` on Linux).
 - [ ] Add `CHANGELOG.md` (Keep a Changelog format).
