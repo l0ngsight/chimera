@@ -1,5 +1,5 @@
-id: scb-software-engineering
-name: SCB Software Engineering Team
+id: copilot-engineering-team
+name: Copilot Engineering Team
 description: >-
   A delivery team for a regulated bank where every agent runs through GitHub Copilot CLI with the
   approved model set. The dev lead plans and coordinates, the architect designs, backend and

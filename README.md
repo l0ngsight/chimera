@@ -85,9 +85,9 @@ API contracts directly. QA files bugs with both engineers, and security sends fi
 (one-way). See [`teams/software-dev.yaml`](teams/software-dev.yaml). Model names are free text: change them
 in the editor to whatever your CLIs accept.
 
-### SCB Software Engineering Team
+### Copilot Engineering Team
 
-A second sample, [`teams/scb-software-engineering.yaml`](teams/scb-software-engineering.yaml), for an
+A second sample, [`teams/copilot-engineering-team.yaml`](teams/copilot-engineering-team.yaml), for an
 environment where every agent must go through **GitHub Copilot CLI** with a fixed set of approved models. The
 prompts are written for a regulated bank: small reviewable changes, tests with every change, no secrets or
 customer data in code or logs, an audit trail, and a security & compliance gate before delivery.
