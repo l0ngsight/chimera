@@ -37,7 +37,8 @@ async function api(method, path, body) {
 }
 
 function toast(msg, isError) {
-  const t = h('div', { class: 'toast' + (isError ? ' error' : '') }, msg);
+  // #toasts is a live region, so screen readers announce each message.
+  const t = h('div', { class: 'toast' + (isError ? ' error' : '') }, isError ? h('span', { class: 'sr-only' }, 'Error: ') : null, msg);
   document.getElementById('toasts').append(t);
   setTimeout(() => t.remove(), isError ? 7000 : 3500);
 }
@@ -48,12 +49,39 @@ function fmtTime(ts) {
   return today ? d.toLocaleTimeString() : d.toLocaleString();
 }
 
+/** Attributes that make a non-button element (a table row) clickable with Enter or Space too. */
+function pressable(fn) {
+  return {
+    tabindex: 0, role: 'button', onclick: fn,
+    onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(); } },
+  };
+}
+
 function slug(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'persona';
 }
 
 let cleanup = [];
 function onLeave(fn) { cleanup.push(fn); }
+
+// Forms are written as `label, control` pairs. This ties each label to the control after it, so
+// screen readers announce the field's name and clicking the label focuses the field. Labels that
+// wrap their control (checkboxes) need nothing. Only newly added nodes are scanned.
+let labelSeq = 0;
+function linkLabels(node) {
+  const labels = node.matches('label') ? [node] : node.querySelectorAll('label');
+  for (const label of labels) {
+    if (label.htmlFor || label.querySelector('input, select, textarea')) continue;
+    let el = label.nextElementSibling;
+    if (el && !el.matches('input, select, textarea')) el = el.matches('.combo') ? el.querySelector('input') : null;
+    if (!el) continue;
+    if (!el.id) el.id = 'field-' + (++labelSeq);
+    label.htmlFor = el.id;
+  }
+}
+new MutationObserver(records => {
+  for (const r of records) for (const n of r.addedNodes) if (n.nodeType === 1 && n.namespaceURI === 'http://www.w3.org/1999/xhtml') linkLabels(n);
+}).observe($app, { childList: true, subtree: true });
 
 let runtimesCache = null;
 async function runtimes() {
@@ -71,14 +99,22 @@ const routes = [
   [/^#\/settings$/, settingsPage, 'settings'],
 ];
 
+// The page currently shown; restored when the user cancels leaving a page with unsaved changes.
+let currentHash = location.hash || '#/';
+
 async function route() {
   cleanup.forEach(fn => { try { fn(); } catch (e) { console.error(e); } });
   cleanup = [];
+  window.__dirty = false;
   const hash = location.hash || '#/';
+  currentHash = hash;
   for (const [re, page, nav] of routes) {
     const m = hash.match(re);
     if (!m) continue;
-    document.querySelectorAll('[data-nav]').forEach(a => a.classList.toggle('active', a.dataset.nav === nav));
+    document.querySelectorAll('[data-nav]').forEach(a => {
+      a.classList.toggle('active', a.dataset.nav === nav);
+      if (a.dataset.nav === nav) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+    });
     $app.replaceChildren();
     try {
       await page(...m.slice(1).map(decodeURIComponent));
@@ -89,7 +125,23 @@ async function route() {
   }
   location.hash = '#/';
 }
-window.addEventListener('hashchange', route);
+// In-app navigation never reloads the page, so `beforeunload` does not fire for it.
+const LEAVE_PROMPT = 'You have unsaved changes. Leave this page and discard them?';
+// Links: ask before the browser navigates, so cancelling leaves no extra history entry.
+document.addEventListener('click', e => {
+  const a = e.target.closest?.('a[href^="#"]');
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  if (!window.__dirty || a.getAttribute('href') === currentHash) return;
+  if (confirm(LEAVE_PROMPT)) window.__dirty = false; else e.preventDefault();
+});
+window.addEventListener('hashchange', () => {
+  // Back/forward and typed addresses: ask, and put the address back if the user stays.
+  if (window.__dirty && location.hash !== currentHash && !confirm(LEAVE_PROMPT)) {
+    history.replaceState(null, '', currentHash);
+    return;
+  }
+  route();
+});
 window.addEventListener('beforeunload', e => { if (window.__dirty) { e.preventDefault(); e.returnValue = ''; } });
 
 // ---------------------------------------------------------------- graph
@@ -138,7 +190,7 @@ function clip(cx, cy, tx, ty) {
  * opts: { editable, onSelect(id|null), onEdgeSelect(index), onMove(id,pos), onConnect(from,to), statusOf(id) }
  */
 function createGraph(wrap, team, opts = {}) {
-  const svg = h('svg', {});
+  const svg = h('svg', { role: 'group', 'aria-label': 'Team graph' });
   wrap.append(svg);
   let pos = layout(team);
   let selected = null, selectedEdge = null, connectFrom = null;
@@ -181,11 +233,19 @@ function createGraph(wrap, team, opts = {}) {
       if (!c) return;
       const [x1, y1, x2, y2] = c;
       const marker = `url(#arrow-${uid})`;
-      const g = h('g', { class: 'edge' + (selectedEdge === i ? ' selected' : '') },
+      const g = h('g', {
+        class: 'edge' + (selectedEdge === i ? ' selected' : ''),
+        tabindex: opts.onEdgeSelect ? 0 : null, role: opts.onEdgeSelect ? 'button' : null,
+        'aria-label': `Channel ${e.from} ${e.bidirectional ? 'and' : 'to'} ${e.to}`,
+      },
         h('line', { class: 'vis', x1, y1, x2, y2, 'marker-end': marker, 'marker-start': e.bidirectional ? marker : null }),
         h('line', { class: 'hit', x1, y1, x2, y2 }),
         h('title', {}, `${e.from} ${e.bidirectional ? '⇄' : '→'} ${e.to}`));
-      if (opts.onEdgeSelect) g.addEventListener('click', ev => { ev.stopPropagation(); selectEdge(i); opts.onEdgeSelect(i); });
+      if (opts.onEdgeSelect) {
+        const pick = () => { selectEdge(i); opts.onEdgeSelect(i); edgeEls[i]?.focus(); };
+        g.addEventListener('click', ev => { ev.stopPropagation(); pick(); });
+        g.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(); } });
+      }
       g.__edge = e;
       g.dataset.from = e.from; g.dataset.to = e.to; g.dataset.bi = e.bidirectional ? '1' : '';
       edgesG.append(g);
@@ -201,6 +261,9 @@ function createGraph(wrap, team, opts = {}) {
       const g = h('g', {
         class: ['node', status, selected === p.id && 'selected', connectFrom === p.id && 'connect-src'].filter(Boolean).join(' '),
         transform: `translate(${at.x - NODE_W / 2},${at.y - NODE_H / 2})`,
+        tabindex: 0, role: 'button',
+        'aria-label': `${p.name}${p.id === team.entry ? ', entry persona' : ''}${status ? ', ' + status : ''}`,
+        'aria-pressed': String(selected === p.id),
       },
         h('rect', { class: 'box', width: NODE_W, height: NODE_H }),
         h('rect', { class: 'stripe', x: 0, y: 8, width: 4, height: NODE_H - 16, fill: runtimeColor(p.runtime) }),
@@ -239,14 +302,25 @@ function createGraph(wrap, team, opts = {}) {
       drag = null;
       if (wasDrag) { opts.onMove?.(id, pos[id]); return; }
       ev.stopPropagation();
-      if (opts.connectMode?.()) {
-        if (connectFrom === null) { connectFrom = id; render(); }
-        else { const from = connectFrom; connectFrom = null; if (from !== id) opts.onConnect?.(from, id); render(); }
-        return;
-      }
-      select(id);
-      opts.onSelect?.(id);
+      activate(id);
     });
+    // Keyboard: Tab to a persona, Enter or Space to select it (or to pick it in connect mode).
+    g.addEventListener('keydown', ev => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      activate(id);
+      nodeEls[id]?.focus(); // render() replaced the element that had focus
+    });
+  }
+
+  function activate(id) {
+    if (opts.connectMode?.()) {
+      if (connectFrom === null) { connectFrom = id; render(); }
+      else { const from = connectFrom; connectFrom = null; if (from !== id) opts.onConnect?.(from, id); render(); }
+      return;
+    }
+    select(id);
+    opts.onSelect?.(id);
   }
 
   /** Endpoints of an edge, clipped to the node boxes; antiparallel one-way edges are offset. */
@@ -373,9 +447,14 @@ async function sessionsPage() {
   }
 
   const listBody = h('tbody');
+  let shown = null;
   function renderList(list) {
+    // Polled every few seconds: re-render only on a change, so keyboard focus stays put.
+    const key = JSON.stringify(list);
+    if (key === shown) return;
+    shown = key;
     listBody.replaceChildren(...(list.length ? list.map(s => h('tr', { class: 'clickable', onclick: () => location.hash = '#/session/' + s.id },
-      h('td', {}, h('div', {}, s.title), h('div', { class: 'muted small' }, s.id)),
+      h('td', {}, h('div', {}, h('a', { href: '#/session/' + encodeURIComponent(s.id), class: 'row-link' }, s.title)), h('div', { class: 'muted small' }, s.id)),
       h('td', {}, s.team_name, s.dry_run ? h('span', { class: 'badge plain small', style: 'margin-left:6px' }, 'dry run') : null),
       h('td', {}, h('span', { class: 'badge ' + s.status }, s.status)),
       h('td', {}, h('span', { class: 'dots' }, Object.entries(s.agents).map(([id, a]) => h('span', { class: 'dot ' + a.status, title: `${id}: ${a.status}` })))),
@@ -402,7 +481,8 @@ async function sessionsPage() {
         guardWarning),
       h('div', { class: 'card' },
         h('h2', {}, 'Sessions'),
-        h('table', {}, h('thead', {}, h('tr', {}, ['Session', 'Team', 'Status', 'Agents', 'Turns', 'Started'].map(c => h('th', {}, c)))), listBody)))));
+        h('div', { class: 'table-wrap' },
+          h('table', {}, h('thead', {}, h('tr', {}, ['Session', 'Team', 'Status', 'Agents', 'Turns', 'Started'].map(c => h('th', {}, c)))), listBody))))));
 }
 
 // ---------------------------------------------------------------- session view
@@ -700,8 +780,12 @@ const MAX_MODEL_ROWS = 100;
  * MAX_MODEL_ROWS rows. Any typed text is accepted as a custom model id.
  */
 function modelPicker(p, onChange) {
-  const input = h('input', { value: p.model, placeholder: 'runtime default — type to search', autocomplete: 'off', spellcheck: 'false' });
-  const menu = h('div', { class: 'combo-menu hidden', role: 'listbox' });
+  const menuId = 'combo-' + Math.random().toString(36).slice(2, 8);
+  const input = h('input', {
+    value: p.model, placeholder: 'runtime default — type to search', autocomplete: 'off', spellcheck: 'false',
+    role: 'combobox', 'aria-autocomplete': 'list', 'aria-expanded': 'false', 'aria-controls': menuId,
+  });
+  const menu = h('div', { class: 'combo-menu hidden', role: 'listbox', id: menuId });
   const info = h('div', { class: 'small muted', style: 'margin-top:4px' });
   let list = null, loadSeq = 0, autoPick = false, rows = [], active = -1;
   const models = () => list?.models || [];
@@ -731,8 +815,8 @@ function modelPicker(p, onChange) {
     onChange();
   }
 
-  function open() { menu.classList.remove('hidden'); renderMenu(); }
-  function close() { menu.classList.add('hidden'); active = -1; }
+  function open() { menu.classList.remove('hidden'); input.setAttribute('aria-expanded', 'true'); renderMenu(); }
+  function close() { menu.classList.add('hidden'); input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); active = -1; }
 
   function renderMenu() {
     const q = input.value.trim().toLowerCase();
@@ -751,7 +835,7 @@ function modelPicker(p, onChange) {
       }
       items.push(h('div', {
         class: 'combo-item' + (m.id === p.model ? ' selected' : '') + (i === active ? ' active' : ''),
-        role: 'option',
+        role: 'option', id: `${menuId}-${i}`, 'aria-selected': String(m.id === p.model),
         onmousedown: e => { e.preventDefault(); commit(m.id); },
       },
         h('span', {}, m.name && m.name !== m.id ? m.name : m.id),
@@ -766,6 +850,8 @@ function modelPicker(p, onChange) {
       items.push(h('div', { class: 'combo-note' }, `${matches.length - rows.length} more — keep typing to narrow down.`));
     }
     menu.replaceChildren(...items);
+    if (active >= 0 && rows[active]) input.setAttribute('aria-activedescendant', `${menuId}-${active}`);
+    else input.removeAttribute('aria-activedescendant');
     menu.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
   }
 
@@ -823,8 +909,9 @@ async function teamEditorPage(teamId) {
   let bidiDefault = true;
   const dirtyEl = h('span', { class: 'dirty' });
   const applyBox = h('input', { type: 'checkbox', checked: true });
-  const setDirty = d => { window.__dirty = d; dirtyEl.textContent = d ? '● unsaved changes' : ''; };
-  setDirty(isNew);
+  // A new team is only worth a "discard changes?" prompt once the user has edited it.
+  const setDirty = d => { window.__dirty = d; dirtyEl.textContent = d ? '● unsaved changes' : isNew ? '● not saved yet' : ''; };
+  setDirty(false);
   onLeave(() => setDirty(false));
 
   // Team metadata form
@@ -919,7 +1006,7 @@ async function teamEditorPage(teamId) {
     side.append(
       h('h2', {}, 'Communication channels'),
       h('p', { class: 'muted small' }, 'Arrows show who may send messages to whom. Use “Connect” to add one; click an arrow to change or remove it.'),
-      team.edges.length ? h('table', {}, h('tbody', {}, team.edges.map((e, i) => h('tr', { class: 'clickable', onclick: () => { selection = { kind: 'edge', index: i }; renderSide(); } },
+      team.edges.length ? h('table', {}, h('tbody', {}, team.edges.map((e, i) => h('tr', { class: 'clickable', ...pressable(() => { selection = { kind: 'edge', index: i }; renderSide(); }), 'aria-label': `Channel ${nameOf(e.from)} ${e.bidirectional ? 'and' : 'to'} ${nameOf(e.to)}` },
         h('td', {}, nameOf(e.from)), h('td', { class: 'muted' }, e.bidirectional ? '⇄' : '→'), h('td', {}, nameOf(e.to)))))) : h('div', { class: 'empty' }, 'No channels yet.'),
       h('h2', { style: 'margin-top:20px' }, 'Personas'),
       h('div', {}, team.personas.map(p => h('div', { class: 'row', style: 'margin:4px 0' },
@@ -932,7 +1019,7 @@ async function teamEditorPage(teamId) {
 
   function edgeForm(e, i) {
     return h('div', {},
-      h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, 'Channel'), h('button', { onclick: () => { selection = null; renderSide(); graph.select(null); } }, '×')),
+      h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, 'Channel'), h('button', { 'aria-label': 'Close', onclick: () => { selection = null; renderSide(); graph.select(null); } }, '×')),
       h('p', {}, h('b', {}, nameOf(e.from)), e.bidirectional ? ' ⇄ ' : ' → ', h('b', {}, nameOf(e.to))),
       h('label', { class: 'inline' }, h('input', { type: 'checkbox', checked: e.bidirectional, onchange: ev => { e.bidirectional = ev.target.checked; setDirty(true); graph.render(); renderSide(); } }), 'Bidirectional (both can message each other)'),
       h('div', { class: 'row', style: 'margin-top:14px' },
@@ -1025,24 +1112,25 @@ async function teamEditorPage(teamId) {
     }
     function fallbackRow(f, i, list) {
       const fp = modelPicker(f, () => changed(false));
-      const rtSel = h('select', { onchange: e => { f.runtime = e.target.value; fp.reset(); changed(false); } },
+      fp.el.querySelector('input').setAttribute('aria-label', `Fallback ${i + 1} model`);
+      const rtSel = h('select', { 'aria-label': `Fallback ${i + 1} runtime`, onchange: e => { f.runtime = e.target.value; fp.reset(); changed(false); } },
         rts.map(r => h('option', { value: r.name }, `${r.label || r.name}${r.available ? '' : ' (not installed)'}`)));
       rtSel.value = f.runtime;
-      const effSel = h('select', { onchange: e => { f.effort = e.target.value; changed(false); } }, EFFORTS.map(x => h('option', { value: x }, x)));
+      const effSel = h('select', { 'aria-label': `Fallback ${i + 1} effort`, onchange: e => { f.effort = e.target.value; changed(false); } }, EFFORTS.map(x => h('option', { value: x }, x)));
       effSel.value = f.effort || 'medium';
       fp.load(false);
       const move = d => { const l = [...list]; [l[i], l[i + d]] = [l[i + d], l[i]]; p.fallbacks = l; changed(false); renderFallbacks(); };
       return h('div', { class: 'fallback-row' },
         h('div', { class: 'row' },
           h('b', { class: 'small' }, `${i + 1}.`), rtSel, effSel,
-          h('button', { class: 'small', title: 'Try earlier', disabled: i === 0, onclick: () => move(-1) }, '↑'),
-          h('button', { class: 'small danger', title: 'Remove', onclick: () => { p.fallbacks = list.filter(x => x !== f); changed(false); renderFallbacks(); } }, '×')),
+          h('button', { class: 'small', title: 'Try earlier', 'aria-label': 'Try earlier', disabled: i === 0, onclick: () => move(-1) }, '↑'),
+          h('button', { class: 'small danger', title: 'Remove', 'aria-label': 'Remove fallback', onclick: () => { p.fallbacks = list.filter(x => x !== f); changed(false); renderFallbacks(); } }, '×')),
         fp.el);
     }
     renderFallbacks();
 
     return h('div', {},
-      h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, 'Persona'), h('button', { onclick: () => { selection = null; graph.select(null); renderSide(); } }, '×')),
+      h('div', { class: 'row between' }, h('h2', { style: 'margin:0' }, 'Persona'), h('button', { 'aria-label': 'Close', onclick: () => { selection = null; graph.select(null); renderSide(); } }, '×')),
       h('div', { class: 'grid', style: 'grid-template-columns:1fr 1fr;gap:0 10px' },
         h('div', {}, h('label', {}, 'Name'), h('input', { value: p.name, oninput: e => { p.name = e.target.value; changed(); refreshEntry(); } })),
         h('div', {}, h('label', {}, 'Id (used in messages)'), idIn)),
@@ -1214,7 +1302,7 @@ function jevCard(settings) {
       Object.entries(JEV_PROVIDERS).map(([name, p]) => h('button', {
         onclick: () => { for (const k of ['base_url', 'model', 'api_key_env', 'timeout_ms']) f[k].value = p[k]; },
       }, name))),
-    h('div', { class: 'grid', style: 'grid-template-columns: 2fr 1fr 1fr 120px; gap: 0 10px' },
+    h('div', { class: 'grid jev-grid' },
       h('div', {}, h('label', {}, 'Base URL'), f.base_url),
       h('div', {}, h('label', {}, 'Model'), f.model),
       h('div', {}, h('label', {}, 'API key env var (empty = no key)'), f.api_key_env),
@@ -1271,13 +1359,13 @@ async function settingsPage() {
       h('div', { class: 'card', style: 'grid-column: 1 / -1' },
         h('h2', {}, 'Agent runtimes'),
         h('p', { class: 'muted small' }, 'Configured in chimera.yaml (command templates, output parsers, model suggestions).'),
-        h('table', {},
+        h('div', { class: 'table-wrap' }, h('table', {},
           h('thead', {}, h('tr', {}, ['Runtime', 'Command', 'Status', 'Model list from'].map(c => h('th', {}, c)))),
           h('tbody', {}, rts.map(r => h('tr', {},
             h('td', {}, h('span', { class: 'dot', style: `display:inline-block;margin-right:6px;background:${runtimeColor(r.name)}` }), h('b', {}, r.name), h('div', { class: 'muted small' }, r.label)),
             h('td', { class: 'mono' }, r.command || '—'),
             h('td', {}, r.available ? h('span', { class: 'badge completed' }, 'available') : h('span', { class: 'badge idle' }, 'not on PATH')),
-            h('td', { class: 'small muted mono' }, r.models_via)))))))));
+            h('td', { class: 'small muted mono' }, r.models_via))))))))));
 }
 
 route();

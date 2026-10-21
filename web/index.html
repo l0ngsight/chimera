@@ -10,14 +10,14 @@
 <body>
   <header class="topbar">
     <a href="#/" class="brand"><span class="logo"></span>Chimera</a>
-    <nav>
+    <nav aria-label="Main">
       <a href="#/" data-nav="sessions">Sessions</a>
       <a href="#/teams" data-nav="teams">Teams</a>
       <a href="#/settings" data-nav="settings">Settings</a>
     </nav>
   </header>
   <main id="app"></main>
-  <div id="toasts"></div>
+  <div id="toasts" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>

@@ -13,11 +13,13 @@ Chimera is published on crates.io as [`chimera-ai`](https://crates.io/crates/chi
 |---|---|
 | `0.1.0` published on crates.io | done 2026-10-18, by hand; installs and runs (`cargo install chimera-ai --locked`) |
 | Package metadata, MIT license, `include` list, Rust 1.88 minimum | done |
-| CI: fmt, clippy, tests on Linux and macOS and Rust 1.88, `cargo package` | done (`.github/workflows/ci.yml`) |
+| CI: fmt, clippy, tests on Linux and macOS and Rust 1.88, musl build, `cargo package`; actions pinned to commit SHAs | done (`.github/workflows/ci.yml`) |
 | Release workflow: binaries, GitHub Release, crates.io trusted publishing | done (`.github/workflows/release.yml`); first tagged run is `0.1.1` |
 | README Install section, `CHANGELOG.md`, `cargo binstall` metadata | done |
 | One-time GitHub and crates.io settings (below) | done 2026-10-18 |
-| Dependency licence and advisory check (`cargo deny` or `cargo audit`) in CI | to do |
+| Advisory check: `cargo audit` weekly and when dependencies change | done (`.github/workflows/audit.yml`) |
+| Dependency and action updates | done (Dependabot, `.github/dependabot.yml`) |
+| Dependency licence check (`cargo deny`) | to do |
 | Windows | not supported (agents and tests rely on `sh`; the process guard has no Windows backend) |
 
 ## One-time setup (clicks)
@@ -73,9 +75,10 @@ This lets the release workflow publish without any API token stored in GitHub.
    - **Block force pushes**
    - **Require a pull request before merging**. Set required approvals to `0` while you are the only
      maintainer.
-   - **Require status checks to pass**. Click **Add checks** and add the five CI jobs:
+   - **Require status checks to pass**. Click **Add checks** and add the six CI jobs:
      `Format and clippy`, `Test (ubuntu-latest, stable)`, `Test (macos-latest, stable)`,
-     `Test (ubuntu-latest, 1.88)` and `Package for crates.io`.
+     `Test (ubuntu-latest, 1.88)`, `Build (x86_64-unknown-linux-musl)` and `Package for crates.io`.
+     Leave `cargo audit` out: a newly published advisory would then block every pull request.
 5. Click **Create**.
 
 ### Optional
@@ -106,6 +109,9 @@ This lets the release workflow publish without any API token stored in GitHub.
 4. Open the run under **Actions → Release**, click **Review deployments**, tick `release` and click
    **Approve and deploy**. The crate is published to crates.io. If that version is already there, this step
    is skipped.
+5. If a job fails (a network error, a rejected approval), open the run and click **Re-run failed jobs**. Every
+   step can run twice: an existing GitHub Release gets its binaries and notes replaced, and a version that is
+   already on crates.io is not published again.
 
 To check that the binaries build without releasing anything, run the workflow by hand: **Actions → Release →
 Run workflow**. Without a tag it only checks and builds.

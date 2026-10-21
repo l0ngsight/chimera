@@ -25,6 +25,23 @@ All notable changes to Chimera are listed here. The format follows
 - A runtime in `chimera.yaml` with a built-in name is merged key by key over the built-in definition instead
   of replacing it, so overriding `models` no longer drops `--no-chrome` and the deny list.
 - `prompt_llm` keys in `chimera.yaml` are all optional.
+- Web UI:
+  - Leaving the team editor with unsaved changes through a link or the back button now asks first.
+    Before, only reloading or closing the tab did. A new team that you have not edited no longer asks.
+  - Form fields are tied to their labels.
+  - Personas and channels in the graph can be selected with Tab and Enter.
+  - The model picker is announced as a combo box.
+  - Notifications are read out by screen readers.
+  - Keyboard focus is visible.
+- The web UI fits phone screens: no page scrolls sideways, and wide tables scroll inside their card.
+- CI:
+  - GitHub Actions are pinned to commit SHAs.
+  - Warnings fail only the clippy job.
+  - CI also builds the static Linux (musl) binary.
+  - A weekly `cargo audit` checks for new advisories.
+  - Dependabot proposes dependency and action updates.
+- The release workflow can be re-run safely. An existing GitHub Release gets its binaries replaced. The
+  crates.io step only publishes after a definite "not found", and stops on any other error.
 
 ### Fixed
 - Live session views no longer miss events: each event carries its sequence number as the SSE id, a

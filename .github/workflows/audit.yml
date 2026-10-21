@@ -1,0 +1,29 @@
+name: Security audit
+
+# Checks Cargo.lock against the RustSec advisory database. It runs when dependencies change and
+# once a week, so a newly published advisory shows up even when nobody touches the code. It is
+# kept out of the CI workflow so that a new advisory does not turn unrelated pull requests red.
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/audit.yml]
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/audit.yml]
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit
+      # Fails on vulnerabilities. Unmaintained or yanked crates are reported as warnings.
+      - run: cargo audit
