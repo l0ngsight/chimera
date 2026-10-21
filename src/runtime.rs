@@ -970,4 +970,48 @@ mod tests {
             assert_eq!(cmd.starts_with("[process guard: env]"), expect_prefix, "{cmd}");
         }
     }
+    /// A guarded agent does not inherit the variables that reach the user's desktop session.
+    #[tokio::test]
+    async fn guarded_processes_do_not_see_desktop_session_variables() {
+        let mut spec = builtin_runtimes()["hermes"].clone();
+        spec.command = "sh".into();
+        spec.args = vec![crate::config::ArgItem::One(
+            "-c".into(),
+        ), crate::config::ArgItem::One(
+            "cat > /dev/null; for v in DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR TMUX; do printf '%s=%s;' \"$v\" \"$(printenv $v)\"; done".into(),
+        )];
+        spec.guard = true;
+        let mut p = persona("", Effort::Medium);
+        p.extra_args = vec![];
+        // The server's own environment has them, as it does on a desktop. (A persona's explicit
+        // `env` can still set them on purpose, e.g. DISPLAY for a visible browser.)
+        for v in ["DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "TMUX"] {
+            // SAFETY: only spawned agent processes read these variables in the test binary.
+            unsafe { std::env::set_var(v, "set") };
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_ctx, crx) = watch::channel(false);
+        let wrapper = crate::guard::Backend {
+            name: "env",
+            program: "env".into(),
+            args: vec![],
+            hidden_env: crate::guard::LINUX_HIDDEN_ENV,
+            covers: "test",
+        };
+        let out = run_process(
+            Invocation {
+                spec: &spec,
+                persona: &p,
+                prompt: "x",
+                workdir: Path::new("."),
+                native_session: None,
+                resume: false,
+                wrapper: Some(wrapper),
+            },
+            tx,
+            crx,
+        )
+        .await;
+        assert_eq!(out.text, "DISPLAY=;DBUS_SESSION_BUS_ADDRESS=;XDG_RUNTIME_DIR=;TMUX=;");
+    }
 }

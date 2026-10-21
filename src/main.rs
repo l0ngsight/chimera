@@ -1,3 +1,4 @@
+mod access;
 mod catalog;
 mod config;
 mod decisions;
@@ -57,6 +58,9 @@ enum Command {
         /// Server to connect to (default: http://<bind>). With an explicit URL no server is started.
         #[arg(long)]
         url: Option<String>,
+        /// Access token of the server (default: $CHIMERA_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -74,6 +78,11 @@ async fn main() -> anyhow::Result<()> {
                 listener.local_addr()?,
                 cfg.data_dir.display()
             );
+            if let Some(token) = state.access.token() {
+                let addr = listener.local_addr()?;
+                let host = if addr.ip().is_unspecified() { "<this-host>".to_string() } else { addr.ip().to_string() };
+                tracing::info!("access token required; open http://{host}:{}/?token={token}", addr.port());
+            }
             let stopping = state.clone();
             axum::serve(listener, web::router(state))
                 .with_graceful_shutdown(async move {
@@ -88,14 +97,16 @@ async fn main() -> anyhow::Result<()> {
             // blocking work (DNS lookups, file I/O) that no longer matters.
             std::process::exit(0);
         }
-        Some(Command::Tui { url }) => {
+        Some(Command::Tui { url, token }) => {
             std::fs::create_dir_all(&cfg.data_dir)?;
             // The terminal belongs to the TUI: log to a file instead.
             let log_path = cfg.data_dir.join("chimera.log");
             init_tracing(Some(&log_path));
             let explicit = url.is_some();
             let mut server = None;
-            let client = tui::Client::new(&url.unwrap_or_else(|| format!("http://{}", cfg.bind)));
+            let token = token.or_else(|| std::env::var(access::TOKEN_ENV).ok());
+            let base = url.unwrap_or_else(|| format!("http://{}", cfg.bind));
+            let mut client = tui::Client::new(&base, token.clone());
             let embedded = if client.ping().await {
                 false
             } else if explicit {
@@ -103,6 +114,10 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 let listener = bind(&cfg).await?;
                 let state = build_state(&cfg).await?;
+                // The embedded server may require a token (non-loopback bind): use it.
+                if token.is_none() && state.access.token().is_some() {
+                    client = tui::Client::new(&base, state.access.token().map(str::to_owned));
+                }
                 server = Some(state.clone());
                 tokio::spawn(async move { axum::serve(listener, web::router(state)).await });
                 true
@@ -203,6 +218,12 @@ async fn build_state(cfg: &Config) -> anyhow::Result<Arc<AppState>> {
         sessions: RwLock::new(sessions),
         shutdown: tokio::sync::watch::channel(false).0,
         catalog: catalog::Catalog::default(),
+        access: access::Access::new(
+            &cfg.bind,
+            std::env::var(access::TOKEN_ENV).ok().or_else(|| cfg.auth_token.clone()),
+            &cfg.allowed_hosts,
+            data_dir,
+        )?,
     }))
 }
 

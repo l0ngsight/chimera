@@ -6,6 +6,25 @@ All notable changes to Chimera are listed here. The format follows
 
 ## [Unreleased]
 
+### Security
+- The HTTP API checks every request: the `Host` header must name this server (stops DNS rebinding), and
+  requests that change something are refused when they come from a page of another origin (stops cross-site
+  request forgery, e.g. a web page cancelling sessions). Before, any web page could cancel your sessions.
+- Listening on a non-loopback address (e.g. `--bind 0.0.0.0:7878`) now requires an access token, generated
+  into `data/token` and printed as a URL to open; it can be set with `auth_token` or `CHIMERA_TOKEN`. The TUI
+  takes `--token`.
+- The settings page can only name `*_API_KEY` variables as API keys, so it can no longer send an arbitrary
+  environment variable to a chosen URL. Jev only falls back to `OPENROUTER_API_KEY`/`TYPESAFE_API_KEY` when
+  talking to that provider.
+- The Linux process guard also removes `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, `TMUX`, `TMUX_PANE` and
+  `STY`, so agents cannot act on your desktop session or terminal multiplexer by default. The docs now say
+  what the guard and the deny lists do and do not cover.
+
+### Changed
+- A runtime in `chimera.yaml` with a built-in name is merged key by key over the built-in definition instead
+  of replacing it, so overriding `models` no longer drops `--no-chrome` and the deny list.
+- `prompt_llm` keys in `chimera.yaml` are all optional.
+
 ### Fixed
 - A persona whose runtime does not exist no longer leaves the session "running" forever; its turn fails
   with "unknown runtime". Saving a team or starting a session with an unknown runtime is now rejected.

@@ -79,7 +79,28 @@ impl Default for DecisionsConfig {
 /// OpenRouter's System One API, which implements TypeSafe's request and response format.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-const FALLBACK_KEY_ENVS: &[&str] = &["JEV_API_KEY", "OPENROUTER_API_KEY", "TYPESAFE_API_KEY"];
+/// Variables tried when `api_key_env` is unset, with the host each key may be sent to (`None`:
+/// Jev's own variable, used for any Jev endpoint). A provider's key only goes to that provider,
+/// so pointing `base_url` elsewhere cannot pick up, say, the OpenRouter key.
+const FALLBACK_KEY_ENVS: &[(&str, Option<&str>)] =
+    &[("JEV_API_KEY", None), ("OPENROUTER_API_KEY", Some("openrouter.ai")), ("TYPESAFE_API_KEY", Some("typesafe.ai"))];
+
+/// The fallback key variables that may be sent to `base_url`.
+fn fallback_key_envs(base_url: &str) -> Vec<&'static str> {
+    FALLBACK_KEY_ENVS
+        .iter()
+        .filter(|(_, host)| host.is_none_or(|h| host_is(base_url, h)))
+        .map(|(var, _)| *var)
+        .collect()
+}
+
+/// Whether `url`'s host is `domain` or one of its subdomains.
+fn host_is(url: &str, domain: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|h| h == domain || h.ends_with(&format!(".{domain}")))
+}
 
 impl DecisionsConfig {
     /// No key is configured on purpose (local servers such as Ollama).
@@ -94,7 +115,7 @@ impl DecisionsConfig {
             return None;
         }
         std::iter::once(self.api_key_env.as_str())
-            .chain(FALLBACK_KEY_ENVS.iter().copied())
+            .chain(fallback_key_envs(&self.base_url))
             .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()).map(|v| (v, var.to_string())))
     }
 
@@ -490,6 +511,16 @@ mod tests {
         assert!(local.api_key().is_none(), "a local server must not receive the cloud key");
         let cloud = DecisionsConfig::default();
         assert_eq!(cloud.api_key().map(|(_, var)| var).as_deref(), Some("JEV_API_KEY"));
+    }
+
+    /// A provider's key is only sent to that provider, whatever `base_url` is set to.
+    #[test]
+    fn fallback_keys_stay_with_their_provider() {
+        assert_eq!(fallback_key_envs(OPENROUTER_BASE_URL), vec!["JEV_API_KEY", "OPENROUTER_API_KEY"]);
+        assert_eq!(fallback_key_envs("https://api.typesafe.ai/v1"), vec!["JEV_API_KEY", "TYPESAFE_API_KEY"]);
+        assert_eq!(fallback_key_envs("https://evil.example/v1"), vec!["JEV_API_KEY"]);
+        assert_eq!(fallback_key_envs("https://openrouter.ai.evil.example/v1"), vec!["JEV_API_KEY"]);
+        assert_eq!(fallback_key_envs("https://notopenrouter.ai/v1"), vec!["JEV_API_KEY"]);
     }
 
     #[test]

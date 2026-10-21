@@ -21,6 +21,13 @@ pub struct Config {
     /// Runtime definitions keyed by name. Merged over the built-in defaults.
     #[serde(default)]
     pub runtimes: BTreeMap<String, RuntimeSpec>,
+    /// Token clients must present (`CHIMERA_TOKEN` overrides it). Without one, a token is only
+    /// required, and then generated, when `bind` is not a loopback address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Extra names the server may be reached by (the `Host` header), e.g. `chimera.lan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -43,6 +50,7 @@ pub enum LlmApi {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PromptLlmConfig {
     #[serde(default)]
     pub api: LlmApi,
@@ -513,6 +521,8 @@ impl Default for Config {
             prompt_llm: PromptLlmConfig::default(),
             decisions: Default::default(),
             runtimes: builtin_runtimes(),
+            auth_token: None,
+            allowed_hosts: vec![],
         }
     }
 }
@@ -523,12 +533,7 @@ impl Config {
         let mut cfg = match path {
             Some(p) if p.exists() => {
                 let text = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-                let mut user: Config =
-                    serde_yaml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
-                let mut runtimes = builtin_runtimes();
-                runtimes.append(&mut user.runtimes);
-                user.runtimes = runtimes;
-                user
+                Self::parse(&text).with_context(|| format!("parsing {}", p.display()))?
             }
             Some(p) => anyhow::bail!("config file {} not found", p.display()),
             None => Config::default(),
@@ -536,6 +541,41 @@ impl Config {
         if cfg.runtimes.is_empty() {
             cfg.runtimes = builtin_runtimes();
         }
+        Ok(cfg)
+    }
+
+    /// Parses a config file. A runtime with a built-in name is merged key by key over the
+    /// built-in definition: `claude: {models: [...]}` changes only the model list and keeps the
+    /// built-in arguments (including `--no-chrome` and the deny list). A key that is given
+    /// replaces the built-in value as a whole, e.g. `args` replaces all arguments.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        use serde_yaml::Value;
+        let mut doc: Value = serde_yaml::from_str(text)?;
+        if doc.is_null() {
+            doc = Value::Mapping(Default::default());
+        }
+        let user_runtimes = doc.as_mapping_mut().and_then(|m| m.remove("runtimes"));
+        let mut cfg: Config = serde_yaml::from_value(doc)?;
+        let mut runtimes = builtin_runtimes();
+        if let Some(Value::Mapping(user)) = user_runtimes {
+            for (name, spec) in user {
+                let name = name.as_str().context("runtime names must be strings")?.to_string();
+                let merged = match (runtimes.get(&name), spec) {
+                    (Some(builtin), Value::Mapping(over)) => {
+                        let mut base = serde_yaml::to_value(builtin)?;
+                        let base_map = base.as_mapping_mut().context("built-in runtime is not a mapping")?;
+                        for (k, v) in over {
+                            base_map.insert(k, v);
+                        }
+                        base
+                    }
+                    (_, spec) => spec,
+                };
+                let spec: RuntimeSpec = serde_yaml::from_value(merged).with_context(|| format!("runtime `{name}`"))?;
+                runtimes.insert(name, spec);
+            }
+        }
+        cfg.runtimes = runtimes;
         Ok(cfg)
     }
 }
@@ -549,6 +589,30 @@ mod tests {
         let cfg: Config = serde_yaml::from_str(include_str!("../chimera.example.yaml")).unwrap();
         assert_eq!(cfg.decisions.model, "jev-latest");
         assert!(cfg.runtimes.contains_key("hermes"));
+    }
+
+    /// Overriding one key of a built-in runtime keeps the rest, including the security flags.
+    #[test]
+    fn user_runtimes_merge_over_builtins() {
+        let cfg = Config::parse(
+            "runtimes:\n  claude:\n    models: [opus]\n    timeout_secs: 60\n  extra:\n    command: aider\n    args: [--yes]\n",
+        )
+        .unwrap();
+        let claude = &cfg.runtimes["claude"];
+        assert_eq!(claude.models, vec!["opus".to_string()]);
+        assert_eq!(claude.timeout_secs, 60);
+        assert_eq!(claude.command, "claude", "untouched keys come from the built-in");
+        let args = format!("{:?}", claude.args);
+        assert!(args.contains("--no-chrome") && args.contains("--disallowedTools"), "{args}");
+        assert!(claude.resume_args.is_some());
+        assert_eq!(cfg.runtimes["extra"].command, "aider");
+        assert!(cfg.runtimes.contains_key("codex"));
+        // An empty file is a valid config.
+        assert!(Config::parse("").unwrap().runtimes.contains_key("claude"));
+        // So is a partial prompt_llm section.
+        let partial = Config::parse("prompt_llm:\n  model: deepseek-reasoner\n").unwrap();
+        assert_eq!(partial.prompt_llm.model, "deepseek-reasoner");
+        assert_eq!(partial.prompt_llm.api_key_env, "DEEPSEEK_API_KEY");
     }
 
     #[test]

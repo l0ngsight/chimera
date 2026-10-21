@@ -1,16 +1,21 @@
 //! Process guard: runs agent CLIs inside an OS sandbox that stops them from killing or quitting
-//! programs they did not start (the user's browser, editors, the Chimera server).
+//! programs they did not start (the user's browser, editors, the Chimera server) by accident.
 //!
 //! Prompt rules and per-CLI deny lists are advisory or partial; an agent can still run
 //! `pkill chrome`, `lsof -ti:PORT | xargs kill` or a script that sends signals. The guard enforces
-//! it at the OS level for every runtime:
+//! the signal part at the OS level for every runtime:
 //!
 //! - **Linux**: a private PID namespace (bubblewrap, or util-linux `unshare`). The agent only sees
 //!   processes it started, so there is nothing else to signal. When the agent exits or is
-//!   cancelled, everything it left running is killed with it. `DISPLAY`/`WAYLAND_DISPLAY` are
-//!   removed so it cannot close windows through the display server either.
+//!   cancelled, everything it left running is killed with it. The variables that point at the
+//!   user's desktop session are removed too (`DISPLAY`, `WAYLAND_DISPLAY`, the D-Bus session bus,
+//!   `XDG_RUNTIME_DIR`, tmux and screen), so `xdotool`, `notify-send`, `systemctl --user` or
+//!   `tmux kill-server` fail by default instead of acting on the user's session.
 //! - **macOS**: `sandbox-exec` with a profile that denies signals outside the sandbox and Apple
 //!   Events (AppleScript `quit`).
+//!
+//! It is not a security sandbox: files, the network and sockets stay reachable (an agent that
+//! sets `DISPLAY=:0` itself can still talk to X11), because agents need them to do their work.
 //!
 //! Each backend is verified on the actual machine at startup (the sandbox starts, cannot signal a
 //! process outside it, and can still stop its own child). The first backend that passes is used;
@@ -29,9 +34,12 @@ pub const MACOS_PROFILE: &str = concat!(
 );
 const MACOS_SIGNALS_ONLY: &str = "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n";
 
-/// Environment variables removed from guarded processes on Linux: without them an agent cannot
-/// close the user's windows through X11/Wayland (`xdotool … windowclose`, `wmctrl -c`).
-const LINUX_HIDDEN_ENV: &[&str] = &["DISPLAY", "WAYLAND_DISPLAY"];
+/// Environment variables removed from guarded processes on Linux. Without them, tools that act on
+/// the user's desktop session fail instead: closing windows through X11/Wayland (`xdotool …
+/// windowclose`, `wmctrl -c`), the session bus and user services (`busctl --user`, `systemctl
+/// --user stop`, `notify-send`), and terminal multiplexers (`tmux kill-server`, `screen -X quit`).
+pub const LINUX_HIDDEN_ENV: &[&str] =
+    &["DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "TMUX", "TMUX_PANE", "STY"];
 
 /// One way of sandboxing a command: `program args… <command> <command args…>`.
 #[derive(Debug, Clone)]

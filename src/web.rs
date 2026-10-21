@@ -34,6 +34,8 @@ pub struct AppState {
     pub sessions: RwLock<BTreeMap<String, Arc<Session>>>,
     /// Flips to true when the server shuts down; ends open event streams.
     pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// Host, same-origin and token checks for every request.
+    pub access: crate::access::Access,
 }
 
 impl AppState {
@@ -96,6 +98,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/stream", get(session_stream))
         .route("/api/sessions/{id}/messages", post(post_message))
         .route("/api/sessions/{id}/cancel", post(cancel_session))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::access::guard))
         .with_state(state)
 }
 
@@ -287,6 +290,26 @@ struct SettingsUpdate {
     guard_enabled: Option<bool>,
 }
 
+/// Names of environment variables the settings page may use as API keys. The variable's value is
+/// sent to the configured `base_url`, so arbitrary names (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`)
+/// are refused; other names can still be set in chimera.yaml.
+fn key_env_allowed(name: &str) -> bool {
+    name.ends_with("_API_KEY")
+        && name.len() > "_API_KEY".len()
+        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn check_key_env(name: &str, what: &str) -> AppResult<()> {
+    if key_env_allowed(name) {
+        Ok(())
+    } else {
+        Err(ApiError::bad(format!(
+            "{what} must name a variable ending in _API_KEY (e.g. DEEPSEEK_API_KEY); \
+             set other names in chimera.yaml"
+        )))
+    }
+}
+
 async fn put_settings(
     State(st): State<Arc<AppState>>,
     Json(update): Json<SettingsUpdate>,
@@ -295,6 +318,14 @@ async fn put_settings(
         && (cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() || cfg.api_key_env.trim().is_empty())
     {
         return Err(ApiError::bad("base_url, model and api_key_env are required"));
+    }
+    if let Some(cfg) = &update.prompt_llm {
+        check_key_env(cfg.api_key_env.trim(), "The prompt LLM's API key variable")?;
+    }
+    if let Some(d) = &update.decisions
+        && !d.api_key_env.trim().is_empty()
+    {
+        check_key_env(d.api_key_env.trim(), "Jev's API key variable")?;
     }
     if let Some(d) = &update.decisions
         && (d.base_url.trim().is_empty() || d.model.trim().is_empty())
@@ -463,4 +494,17 @@ async fn cancel_session(State(st): State<Arc<AppState>>, Path(id): Path<String>)
     let session = find_session(&st, &id)?;
     st.orchestrator.cancel(&session);
     Ok(StatusCode::ACCEPTED)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_api_key_variables_can_be_named_from_the_settings_page() {
+        for ok in ["DEEPSEEK_API_KEY", "JEV_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_API_KEY", "MY2_API_KEY"] {
+            assert!(super::key_env_allowed(ok), "{ok}");
+        }
+        for bad in ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "HOME", "_API_KEY", "deepseek_api_key", "A_API_KEY ", ""] {
+            assert!(!super::key_env_allowed(bad), "{bad}");
+        }
+    }
 }
