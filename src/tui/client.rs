@@ -57,8 +57,17 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(base: &str) -> Self {
-        Self { base: base.trim_end_matches('/').to_string(), http: reqwest::Client::new() }
+    /// `token`: the server's access token, sent with every request (see `access.rs`).
+    pub fn new(base: &str, token: Option<String>) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(Ok(mut value)) =
+            token.filter(|t| !t.is_empty()).map(|t| format!("Bearer {t}").parse::<reqwest::header::HeaderValue>())
+        {
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        let http = reqwest::Client::builder().default_headers(headers).build().unwrap_or_default();
+        Self { base: base.trim_end_matches('/').to_string(), http }
     }
 
     pub fn base(&self) -> &str {
@@ -98,7 +107,9 @@ impl Client {
             .timeout(Duration::from_millis(800))
             .send()
             .await
-            .map(|r| r.status().is_success())
+            // A 401 is a running server that wants a token: connect anyway and report it, rather
+            // than starting a second server on the same port.
+            .map(|r| r.status().is_success() || r.status() == reqwest::StatusCode::UNAUTHORIZED)
             .unwrap_or(false)
     }
 

@@ -42,6 +42,7 @@ your `PATH`.
 chimera                        # web UI at http://127.0.0.1:7878
 chimera tui                    # terminal UI (see below)
 # options: --bind 0.0.0.0:7878 --data-dir ./data --config chimera.yaml
+# (any address but 127.0.0.1 needs an access token: see "Access to the server")
 # from a checkout: cargo run --release [-- tui]
 ```
 
@@ -229,7 +230,11 @@ without it. Dry runs never call Jev.
 
 ## Configuration
 
-Copy `chimera.example.yaml` to `chimera.yaml`. Runtimes are command templates:
+Copy `chimera.example.yaml` to `chimera.yaml` (Chimera reads `./chimera.yaml`, or the file given with
+`--config`; `data/` is also relative to the current directory unless `--data-dir` says otherwise). Runtimes are
+command templates. An entry with a built-in name is merged key by key over the built-in definition, so
+`claude: {models: [opus]}` only changes the model list; a key you give replaces that whole value (giving
+`args` replaces all arguments, including `--no-chrome` and the deny list, so copy them over when you do):
 
 ```yaml
 runtimes:
@@ -294,19 +299,51 @@ you may be using at the same time. Chimera layers these guardrails:
 
 | Guardrail | Applies to | Enforced by |
 |---|---|---|
-| **Process guard**: the agent cannot kill or quit any program it did not start (your browser, editors, the Chimera server) but can still stop its own processes | every runtime (on macOS Codex uses its own sandbox) | **Linux**: private PID namespace via bubblewrap (`bwrap`), falling back to `unshare`; the agent cannot see other processes, `DISPLAY`/`WAYLAND_DISPLAY` are removed, and whatever it leaves running is stopped with it. **macOS**: `sandbox-exec`. Verified by a self-test at startup; status and switch in **Settings → Process guard** |
+| **Process guard**: the agent cannot send signals to programs it did not start (your browser, editors, the Chimera server), so it cannot kill or quit them, but it can still stop its own processes | every runtime (on macOS Codex uses its own sandbox) | **Linux**: private PID namespace via bubblewrap (`bwrap`), falling back to `unshare`; the agent cannot see other processes, and whatever it leaves running is stopped with it. The variables pointing at your desktop session are removed (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, `TMUX`, `TMUX_PANE`, `STY`), so `xdotool`, `notify-send`, `systemctl --user` or `tmux kill-server` fail by default; an agent that deliberately sets them again can still reach those sockets. **macOS**: `sandbox-exec`, which also blocks Apple Events (AppleScript `quit`). Verified by a self-test at startup; status and switch in **Settings → Process guard** |
 | Never kill, quit or restart programs it didn't start (browser, editors, the Chimera server); no killing by name or port; browser testing only in a headless browser with its own profile | every runtime | ground rules in every prompt |
-| `pkill`, `killall`, `kill`, `… \| xargs kill`, `osascript`, `shutdown`, `reboot` are denied (also inside pipes and `&&` chains) | Claude | `--disallowedTools` (holds even with `bypassPermissions`) |
+| `pkill`, `killall`, `kill`, `… \| xargs kill`, `osascript`, `shutdown`, `reboot` are denied (also inside pipes and `&&` chains). These are prefix rules that catch the usual commands, not a boundary: `sh -c "pkill …"`, `/usr/bin/kill` or a script get through, which is what the process guard is for | Claude, Copilot | `--disallowedTools` (holds even with `bypassPermissions`); Copilot `--deny-tool` |
 | No access to your real Chrome through Claude in Chrome | Claude | `--no-chrome` |
 | Shell commands run in Codex's sandbox: writes confined to the workspace, network allowed, signals only within the sandbox | Codex | `--sandbox workspace-write` (macOS sandboxes can't be nested, so Codex uses its own instead of the process guard) |
 | opencode approves its own permission requests (it can work outside the workspace, e.g. in `/tmp`) unless a rule denies them. To limit it, remove `--auto` from the opencode runtime in `chimera.yaml` and allow only what you want per persona, e.g. env `OPENCODE_CONFIG_CONTENT={"permission":{"external_directory":{"/tmp/**":"allow"}}}` | opencode | `--auto` |
 
 The process guard is on by default and needs no configuration. On Linux it needs bubblewrap
 (`sudo apt install bubblewrap` / `sudo dnf install bubblewrap`) or unprivileged user namespaces for `unshare`. If
-its self-test fails, Settings says why and the new-session form shows a warning. It protects your running programs, not your files: agents
-can still read and write anything your user can. For full isolation, run Chimera (and the CLIs) in a container,
-VM or separate OS user. The server
-binds to `127.0.0.1` by default and has no authentication. Do not expose it publicly.
+its self-test fails, Settings says why and the new-session form shows a warning. It protects your running programs, not your files or
+network: agents can still read and write anything your user can, reach any socket, and use the network. For full isolation, run
+Chimera (and the CLIs) in a container, VM or separate OS user.
+
+### Access to the server
+
+The API can start agent processes in any directory, so only you should reach it. Every request is checked:
+
+- **Host**: the `Host` header must be `localhost`, `127.0.0.1`, `[::1]`, the address Chimera listens on, or a name in
+  `allowed_hosts`. This stops DNS rebinding (a web page making its own domain resolve to your machine).
+- **Same origin**: requests that change something (POST, PUT, DELETE) from a page of another origin are refused, so a
+  web page cannot start or cancel sessions in the background.
+- **Token**: by default Chimera listens on `127.0.0.1` and needs no token. When it listens on any other address
+  (`--bind 0.0.0.0:7878`), or when `auth_token` (or `CHIMERA_TOKEN`) is set, every request needs the token. Without a
+  configured one, Chimera generates a token on first start, keeps it in `data/token`, and prints the URL to open:
+  `http://<host>:7878/?token=…`. The browser keeps it in a cookie; the TUI takes `--token` or `CHIMERA_TOKEN`.
+
+```yaml
+auth_token: change-me            # or set CHIMERA_TOKEN
+allowed_hosts: [chimera.lan]     # extra names the server is reached by
+```
+
+The token protects the API, not the traffic: Chimera speaks plain HTTP, so on an untrusted network put it behind a
+TLS proxy or an SSH tunnel (`ssh -L 7878:localhost:7878 host`). From the settings page, API keys can only be read from
+variables ending in `_API_KEY`; other names can be set in `chimera.yaml`.
+
+### Environment variables
+
+| Variable | Used for |
+|---|---|
+| `DEEPSEEK_API_KEY` (or the one named in Settings) | persona prompt generation |
+| `JEV_API_KEY`, `OPENROUTER_API_KEY`, `TYPESAFE_API_KEY` | Jev quick decisions (the last two only for their own provider) |
+| `ANTHROPIC_API_KEY` | listing every Claude model in the persona editor |
+| `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` | GitHub Copilot CLI login (read by `copilot`) |
+| `CHIMERA_TOKEN` | API access token for the server and the TUI |
+| `RUST_LOG` | log level, e.g. `chimera=debug` |
 
 ## Data layout
 

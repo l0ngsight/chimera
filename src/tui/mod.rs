@@ -612,7 +612,7 @@ mod tests {
 
     fn app() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
-        App::new(Client::new("http://127.0.0.1:7878"), false, tx)
+        App::new(Client::new("http://127.0.0.1:7878", None), false, tx)
     }
 
     #[tokio::test]
