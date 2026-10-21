@@ -181,8 +181,19 @@ async fn get_team(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Ap
     st.teams.get(&id)?.map(Json).ok_or_else(|| ApiError::not_found("team"))
 }
 
+/// Rejects teams whose personas (or their fallbacks) use a runtime that is not configured.
+fn check_runtimes(st: &AppState, team: &Team) -> AppResult<()> {
+    let unknown = st.orchestrator.unknown_runtimes(team);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let known: Vec<&str> = st.orchestrator.runtimes.keys().map(String::as_str).collect();
+    Err(ApiError::bad(format!("unknown runtime ({}); configured runtimes: {}", unknown.join(", "), known.join(", "))))
+}
+
 async fn create_team(State(st): State<Arc<AppState>>, Json(team): Json<Team>) -> AppResult<Json<Team>> {
     team.validate().map_err(ApiError::bad)?;
+    check_runtimes(&st, &team)?;
     if st.teams.get(&team.id)?.is_some() {
         return Err(ApiError(StatusCode::CONFLICT, format!("team '{}' already exists", team.id)));
     }
@@ -211,6 +222,7 @@ async fn update_team(
         return Err(ApiError::bad("team id in body does not match the URL"));
     }
     team.validate().map_err(ApiError::bad)?;
+    check_runtimes(&st, &team)?;
     st.teams.save(&team)?;
     let mut updated = 0;
     if q.apply_to_sessions {
@@ -347,6 +359,10 @@ async fn create_session(
     Json(req): Json<CreateSession>,
 ) -> AppResult<Json<crate::session::SessionSummary>> {
     let team = st.teams.get(&req.team_id)?.ok_or_else(|| ApiError::not_found("team"))?;
+    // Dry runs use the built-in mock runtime for every persona.
+    if !req.dry_run {
+        check_runtimes(&st, &team)?;
+    }
     let workdir = req.workdir.filter(|w| !w.trim().is_empty()).map(|w| PathBuf::from(shellexpand(&w)));
     let session = st
         .orchestrator

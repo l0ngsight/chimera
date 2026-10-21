@@ -190,6 +190,10 @@ pub struct AgentState {
     /// Fallback level in use (0 = the persona's primary runtime/model/effort).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fallback: usize,
+    /// Messages taken from the inbox by the turn that is running. Saved so that a crash or
+    /// restart mid-turn puts them back into the inbox instead of losing them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight: Vec<InboxMessage>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -206,6 +210,7 @@ impl AgentState {
             notes: vec![],
             inbox: vec![],
             fallback: 0,
+            in_flight: vec![],
         }
     }
 
@@ -315,6 +320,15 @@ impl Session {
                 if let Ok(ev) = serde_json::from_str::<Event>(&line) {
                     events.push(ev);
                 }
+            }
+        }
+        // A turn that was running when the server stopped never finished: its messages go back
+        // to the front of the inbox.
+        for a in meta.agents.values_mut() {
+            if !a.in_flight.is_empty() {
+                let mut inbox = std::mem::take(&mut a.in_flight);
+                inbox.append(&mut a.inbox);
+                a.inbox = inbox;
             }
         }
         let interrupted = meta.status == SessionStatus::Running;
