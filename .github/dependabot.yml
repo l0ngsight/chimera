@@ -1,0 +1,20 @@
+# Weekly pull requests for Rust dependencies and for the pinned GitHub Actions.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One pull request for all compatible (minor and patch) updates.
+      cargo-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
