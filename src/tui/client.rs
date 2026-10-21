@@ -150,20 +150,21 @@ impl Client {
     }
 
     /// Follows a session's event stream (full history first, then live), reconnecting if the
-    /// connection drops. Events are sent to `tx`; duplicates after a reconnect have seq numbers
-    /// the receiver has already seen.
+    /// connection drops. A reconnect resumes after the last event received.
     pub async fn follow(self, id: String, tx: mpsc::UnboundedSender<Event>) {
+        let mut last = 0u64;
         loop {
-            let resp = self.http.get(format!("{}/api/sessions/{id}/stream", self.base)).send().await;
+            let resp = self.http.get(format!("{}/api/sessions/{id}/stream?after={last}", self.base)).send().await;
             if let Ok(resp) = resp.and_then(|r| r.error_for_status()) {
                 let mut parser = SseParser::default();
                 let mut body = resp.bytes_stream();
                 while let Some(Ok(chunk)) = body.next().await {
                     for data in parser.push(&chunk) {
-                        if let Ok(ev) = serde_json::from_str::<Event>(&data)
-                            && tx.send(ev).is_err()
-                        {
-                            return; // the view was closed
+                        if let Ok(ev) = serde_json::from_str::<Event>(&data) {
+                            last = last.max(ev.seq);
+                            if tx.send(ev).is_err() {
+                                return; // the view was closed
+                            }
                         }
                     }
                 }

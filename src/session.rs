@@ -194,6 +194,9 @@ pub struct AgentState {
     /// restart mid-turn puts them back into the inbox instead of losing them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_flight: Vec<InboxMessage>,
+    /// Every configuration of the persona is rate limited: its messages wait until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_until: Option<DateTime<Utc>>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -211,6 +214,7 @@ impl AgentState {
             inbox: vec![],
             fallback: 0,
             in_flight: vec![],
+            parked_until: None,
         }
     }
 
@@ -292,6 +296,9 @@ pub struct Inner {
     pub cancel: watch::Sender<bool>,
     pub mock: HashMap<String, MockState>,
     pub mock_claimed: HashSet<String>,
+    /// User messages that arrived while the session was winding down (after `<final>` or a
+    /// cancel, while turns still finish): delivered once it has stopped, starting a new round.
+    pub held_back: Vec<(String, InboxMessage)>,
     log_file: Option<File>,
 }
 
@@ -325,6 +332,8 @@ impl Session {
         // A turn that was running when the server stopped never finished: its messages go back
         // to the front of the inbox.
         for a in meta.agents.values_mut() {
+            // Known limits are not kept across restarts, so the primary is simply tried again.
+            a.parked_until = None;
             if !a.in_flight.is_empty() {
                 let mut inbox = std::mem::take(&mut a.in_flight);
                 inbox.append(&mut a.inbox);
@@ -371,6 +380,7 @@ impl Session {
                 cancel,
                 mock: HashMap::new(),
                 mock_claimed: HashSet::new(),
+                held_back: vec![],
                 log_file: Some(log_file),
             }),
             tx,
@@ -393,9 +403,61 @@ impl Session {
     }
 
     /// Snapshot of past events plus a receiver for future ones, without gaps.
-    pub fn subscribe(&self) -> (Vec<Event>, broadcast::Receiver<Event>) {
+    /// Events with `seq > after` plus a receiver for future ones, without gaps. A client that
+    /// reconnects with the last seq it saw only gets what it missed.
+    pub fn subscribe_after(&self, after: u64) -> (Vec<Event>, broadcast::Receiver<Event>) {
         let inner = self.lock();
-        (inner.events.clone(), self.tx.subscribe())
+        (Self::tail(&inner.events, after), self.tx.subscribe())
+    }
+
+    /// Events with `seq > after`.
+    pub fn events_after(&self, after: u64) -> Vec<Event> {
+        Self::tail(&self.lock().events, after)
+    }
+
+    fn tail(events: &[Event], after: u64) -> Vec<Event> {
+        // Sequence numbers only grow, so the events after `after` are a suffix.
+        let start = events.partition_point(|e| e.seq <= after);
+        events[start..].to_vec()
+    }
+
+    /// Past events, then live ones, for one subscriber. Never skips an event: when the subscriber
+    /// falls behind the broadcast channel (it lagged), the missed events are re-read from the
+    /// session. After the past events comes one [`StreamItem::ReplayDone`].
+    pub fn event_stream(self: &Arc<Self>, after: u64) -> impl futures::Stream<Item = StreamItem> + use<> {
+        struct St {
+            session: Arc<Session>,
+            rx: broadcast::Receiver<Event>,
+            pending: std::collections::VecDeque<Event>,
+            last: u64,
+            replay_done: bool,
+        }
+        let (history, rx) = self.subscribe_after(after);
+        let last = history.last().map(|e| e.seq).unwrap_or(after);
+        let st = St { session: self.clone(), rx, pending: history.into(), last, replay_done: false };
+        futures::stream::unfold(st, |mut st| async move {
+            loop {
+                if let Some(e) = st.pending.pop_front() {
+                    st.last = e.seq;
+                    return Some((StreamItem::Event(e), st));
+                }
+                if !st.replay_done {
+                    st.replay_done = true;
+                    return Some((StreamItem::ReplayDone, st));
+                }
+                match st.rx.recv().await {
+                    Ok(e) if e.seq > st.last => {
+                        st.last = e.seq;
+                        return Some((StreamItem::Event(e), st));
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        st.pending = st.session.events_after(st.last).into();
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
     }
 
     pub fn events_for(&self, agent: Option<&str>) -> Vec<Event> {
@@ -416,6 +478,14 @@ impl Session {
         let inner = self.lock();
         inner.save(&self.dir);
     }
+}
+
+/// An item of [`Session::event_stream`].
+#[derive(Debug)]
+pub enum StreamItem {
+    Event(Event),
+    /// All events that existed when the stream started have been sent; what follows is live.
+    ReplayDone,
 }
 
 fn is_message_involving(e: &Event, agent: Option<&str>) -> bool {
@@ -492,5 +562,75 @@ impl Inner {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn session() -> Arc<Session> {
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: mock}\n").unwrap();
+        let dir = std::env::temp_dir().join(format!("chimera-session-{}", uuid::Uuid::new_v4()));
+        let meta = SessionMeta {
+            id: "s".into(),
+            title: "t".into(),
+            task: "t".into(),
+            agents: [("a".to_string(), AgentState::new())].into(),
+            team,
+            workdir: dir.clone(),
+            dry_run: true,
+            status: SessionStatus::Idle,
+            status_detail: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            round_turns: 0,
+            total_turns: 0,
+            final_answer: None,
+            retired: Default::default(),
+        };
+        Session::create(dir, meta).unwrap()
+    }
+
+    fn log(s: &Session, i: usize) {
+        s.emit(None, EventBody::Log { kind: LogKind::Info, text: i.to_string() });
+    }
+
+    async fn next_seqs(stream: &mut (impl futures::Stream<Item = StreamItem> + Unpin), n: usize) -> Vec<u64> {
+        let mut out = vec![];
+        while out.len() < n {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                Ok(Some(StreamItem::Event(e))) => out.push(e.seq),
+                Ok(Some(StreamItem::ReplayDone)) => {}
+                other => panic!("stream ended early: {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// The stream replays history, marks the end of the replay, resumes after a given seq, and
+    /// never loses events when the subscriber falls behind the broadcast channel.
+    #[tokio::test]
+    async fn event_stream_resumes_and_survives_lag() {
+        let s = session();
+        for i in 0..10 {
+            log(&s, i);
+        }
+        let mut stream = Box::pin(s.event_stream(0));
+        assert_eq!(next_seqs(&mut stream, 10).await, (1..=10).collect::<Vec<_>>());
+        assert!(matches!(stream.next().await, Some(StreamItem::ReplayDone)));
+
+        // Far more events than the broadcast channel holds, before the subscriber reads any.
+        for i in 0..6000 {
+            log(&s, i);
+        }
+        assert_eq!(next_seqs(&mut stream, 6000).await, (11..=6010).collect::<Vec<_>>());
+
+        // A reconnecting client only gets what came after the last seq it saw.
+        let mut resumed = Box::pin(s.event_stream(6005));
+        assert_eq!(next_seqs(&mut resumed, 5).await, (6006..=6010).collect::<Vec<_>>());
+        assert!(matches!(resumed.next().await, Some(StreamItem::ReplayDone)));
     }
 }

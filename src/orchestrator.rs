@@ -123,10 +123,26 @@ impl Orchestrator {
         }
         {
             let mut inner = session.lock();
-            let Some(agent) = inner.meta.agents.get_mut(to) else {
+            if !inner.meta.agents.contains_key(to) {
                 anyhow::bail!("unknown persona '{to}'");
-            };
-            agent.inbox.push(InboxMessage { from: USER.into(), content: content.into(), wake: true });
+            }
+            let message = InboxMessage { from: USER.into(), content: content.into(), wake: true };
+            // The session is winding down: `finalize` would clear the inboxes, so keep the message
+            // aside; the scheduler delivers it once the session has stopped.
+            if inner.scheduler_active && inner.stopping.is_some() {
+                inner.held_back.push((to.to_string(), message));
+                let body = EventBody::Message {
+                    from: USER.into(),
+                    to: to.into(),
+                    content: content.into(),
+                    rejected: false,
+                    deferred: false,
+                };
+                session.emit_locked(&mut inner, None, body);
+                return Ok(());
+            }
+            let agent = inner.meta.agents.get_mut(to).expect("checked above");
+            agent.inbox.push(message);
             if agent.status != AgentStatus::Running {
                 agent.status = AgentStatus::Queued;
             }
@@ -338,17 +354,7 @@ impl Orchestrator {
             session.wake.notify_one();
             return;
         }
-        inner.scheduler_active = true;
-        inner.stopping = None;
-        inner.cancel = watch::channel(false).0;
-        inner.meta.status = SessionStatus::Running;
-        inner.meta.status_detail = None;
-        session.emit_locked(
-            &mut inner,
-            None,
-            EventBody::SessionStatus { status: SessionStatus::Running, detail: None },
-        );
-        inner.save(&session.dir);
+        activate(session, &mut inner);
         drop(inner);
         let (orch, session) = (self.clone(), session.clone());
         tokio::spawn(async move { orch.run_scheduler(session).await });
@@ -363,7 +369,12 @@ impl Orchestrator {
                 }
                 if inner.running.is_empty() {
                     finalize(&session, &mut inner);
-                    return;
+                    if !deliver_held_back(&session, &mut inner) {
+                        return;
+                    }
+                    // Messages arrived while the session wound down: run a new round.
+                    activate(&session, &mut inner);
+                    continue;
                 }
             }
             session.wake.notified().await;
@@ -380,6 +391,9 @@ impl Orchestrator {
             let agent = &inner.meta.agents[&persona.id];
             if !agent.has_work() || inner.running.contains(&persona.id) {
                 continue;
+            }
+            if agent.parked_until.is_some_and(|t| t > Utc::now()) {
+                continue; // waiting for a usage limit to reset
             }
             self.start_turn(session, inner, persona.clone());
         }
@@ -550,6 +564,24 @@ impl Orchestrator {
         });
     }
 
+    /// Un-parks personas whose usage limit has reset and continues the session if they have work.
+    pub fn resume_parked(self: &Arc<Self>, session: &Arc<Session>) {
+        let mut inner = session.lock();
+        let now = Utc::now();
+        let mut resumed = false;
+        for agent in inner.meta.agents.values_mut() {
+            if agent.parked_until.is_some_and(|t| t <= now) {
+                agent.parked_until = None;
+                resumed |= agent.has_work();
+            }
+        }
+        inner.save(&session.dir);
+        drop(inner);
+        if resumed {
+            self.start(session);
+        }
+    }
+
     /// Lets Jev lower (or, if allowed, raise) the effort of this turn; returns the persona to run.
     async fn advise_effort(
         &self,
@@ -589,7 +621,7 @@ impl Orchestrator {
     /// fallback that is not limited, re-queues the turn's messages for it. Returns whether the
     /// turn was handed to a fallback (otherwise it completes as a normal failure).
     fn on_limit(
-        &self,
+        self: &Arc<Self>,
         session: &Arc<Session>,
         primary: &Persona,
         level: usize,
@@ -607,19 +639,54 @@ impl Orchestrator {
         });
 
         let mut inner = session.lock();
-        let Some(next) = next.filter(|_| inner.stopping.is_none()) else {
+        if inner.stopping.is_some() {
+            return false;
+        }
+        let Some(next) = next else {
+            // Nothing left to switch to: park the persona until the earliest reset rather than
+            // failing the turn. Its messages wait in the inbox and it continues by itself.
+            let resume_at = (0..primary.levels())
+                .filter_map(|l| {
+                    let p = primary.at_level(l);
+                    self.limits.limited_until(&p.runtime, &p.model, now)
+                })
+                .min()
+                .unwrap_or(until);
             let hint = if primary.fallbacks.is_empty() {
-                "Add a fallback runtime/model to this persona in the team editor to keep working through limits."
+                " Add a fallback runtime/model to this persona in the team editor to keep working through limits."
             } else {
-                "Every fallback of this persona is rate limited too."
+                ""
             };
             let text = format!(
-                "{} hit a usage limit (resets around {}). {hint}",
+                "{} hit a usage limit and no fallback is available; waiting until around {} to continue.{hint}",
                 failed.runtime_label(),
-                until.with_timezone(&chrono::Local).format("%a %H:%M")
+                resume_at.with_timezone(&chrono::Local).format("%a %H:%M")
             );
-            session.emit_locked(&mut inner, Some(&primary.id), EventBody::Log { kind: LogKind::Info, text });
-            return false;
+            let id = primary.id.as_str();
+            let err = output.error.clone().unwrap_or_default();
+            session.emit_locked(&mut inner, Some(id), EventBody::Log { kind: LogKind::Error, text: err.clone() });
+            let duration_ms = elapsed.as_millis() as u64;
+            session.emit_locked(&mut inner, Some(id), EventBody::TurnEnd { turn, duration_ms, error: Some(err) });
+            session.emit_locked(&mut inner, Some(id), EventBody::Log { kind: LogKind::Info, text });
+            inner.meta.round_turns = inner.meta.round_turns.saturating_sub(1);
+            let agent = inner.meta.agents.get_mut(id).expect("agent exists");
+            agent.inbox.splice(0..0, incoming.iter().cloned());
+            agent.notes.splice(0..0, notes.iter().cloned());
+            agent.in_flight.clear();
+            agent.parked_until = Some(resume_at);
+            agent.status = AgentStatus::Waiting;
+            session.emit_locked(&mut inner, Some(id), EventBody::AgentStatus { status: AgentStatus::Waiting });
+            inner.running.remove(id);
+            inner.save(&session.dir);
+            drop(inner);
+            session.wake.notify_one();
+            let (orch, session) = (self.clone(), session.clone());
+            tokio::spawn(async move {
+                let wait = (resume_at - Utc::now()).to_std().unwrap_or_default();
+                tokio::time::sleep(wait + Duration::from_secs(1)).await;
+                orch.resume_parked(&session);
+            });
+            return true;
         };
 
         let id = primary.id.as_str();
@@ -854,10 +921,57 @@ fn complete_turn(
     session.wake.notify_one();
 }
 
+/// Marks the session running (a new round) and resets the cancel signal.
+fn activate(session: &Session, inner: &mut Inner) {
+    inner.scheduler_active = true;
+    inner.stopping = None;
+    inner.cancel = watch::channel(false).0;
+    inner.meta.status = SessionStatus::Running;
+    inner.meta.status_detail = None;
+    session.emit_locked(inner, None, EventBody::SessionStatus { status: SessionStatus::Running, detail: None });
+    inner.save(&session.dir);
+}
+
+/// After `finalize`: puts user messages held back during the wind-down into their inboxes.
+/// Returns whether a new round should start (not when the server is stopping: then the messages
+/// wait in the saved inbox until the session is continued).
+fn deliver_held_back(session: &Session, inner: &mut Inner) -> bool {
+    let held = std::mem::take(&mut inner.held_back);
+    if held.is_empty() {
+        return false;
+    }
+    let stopping_server = inner.meta.status == SessionStatus::Interrupted;
+    for (to, message) in held {
+        let Some(agent) = inner.meta.agents.get_mut(&to) else { continue };
+        agent.inbox.push(message);
+        if !stopping_server && agent.status != AgentStatus::Queued {
+            agent.status = AgentStatus::Queued;
+            session.emit_locked(inner, Some(&to), EventBody::AgentStatus { status: AgentStatus::Queued });
+        }
+    }
+    inner.save(&session.dir);
+    if stopping_server {
+        return false;
+    }
+    inner.meta.round_turns = 0;
+    inner.meta.final_answer = None;
+    inner.mock.clear();
+    inner.mock_claimed.clear();
+    true
+}
+
 /// Called with no turns running: decides the session's resting status.
 fn finalize(session: &Arc<Session>, inner: &mut Inner) {
+    let parked_until = inner.meta.agents.values().filter(|a| a.has_work()).filter_map(|a| a.parked_until).min();
     let (status, detail) = match inner.stopping.take() {
         Some(s) => s,
+        None if parked_until.is_some() => (
+            SessionStatus::Idle,
+            Some(format!(
+                "waiting for usage limits to reset; continues around {}",
+                parked_until.unwrap_or_default().with_timezone(&chrono::Local).format("%a %H:%M")
+            )),
+        ),
         None if inner.meta.agents.values().any(|a| a.has_work()) => (
             SessionStatus::Idle,
             Some(format!("turn limit reached ({} turns); send a message to continue", inner.meta.team.max_turns)),
@@ -1583,6 +1697,45 @@ mod e2e_tests {
         assert_eq!(session.lock().meta.final_answer.as_deref(), Some("ok"));
     }
 
+    /// A message sent while a session winds down (after a cancel, before the turn has stopped)
+    /// is handled in a new round instead of being cleared with the inboxes.
+    #[tokio::test]
+    async fn messages_sent_while_winding_down_are_not_lost() {
+        let mut rts = builtin_runtimes();
+        rts.insert(
+            "windy".into(),
+            RuntimeSpec {
+                label: "windy".into(),
+                command: "sh".into(),
+                args: vec![
+                    ArgItem::One("-c".into()),
+                    ArgItem::One(
+                        "prompt=$(cat); case \"$prompt\" in *second*) printf '<final>done second</final>' ;; *) sleep 30 ;; esac"
+                            .into(),
+                    ),
+                ],
+                output: OutputFormat::Text,
+                ..rts["hermes"].clone()
+            },
+        );
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: windy}\n")
+                .unwrap();
+        let orch = orchestrator(rts);
+        let session = orch
+            .create_session(NewSession { team, task: "first".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        wait_until_running(&session, "a").await;
+        orch.cancel(&session);
+        // The turn is still being stopped: the session is winding down.
+        orch.post_message(&session, "a", "second").unwrap();
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Completed);
+        let inner = session.lock();
+        assert_eq!(inner.meta.final_answer.as_deref(), Some("done second"));
+        assert_eq!(inner.meta.agents["a"].turns, 2);
+        assert!(inner.held_back.is_empty());
+    }
+
     #[tokio::test]
     async fn cancel_stops_running_processes() {
         let mut rts = builtin_runtimes();
@@ -1851,16 +2004,36 @@ mod e2e_tests {
         }
         assert!(orch.limits.limited_until("limited", "big", Utc::now()).is_some());
 
-        // Without a fallback the turn fails, with a hint to configure one.
+        // Without a usable fallback the persona waits for the reset (with a hint to configure
+        // a fallback) instead of failing; its message stays in the inbox.
         orch.post_message(&session, "b", "hello").unwrap();
         assert_eq!(wait_until_settled(&session).await, SessionStatus::Idle);
         {
             let inner = session.lock();
-            assert_eq!(inner.meta.agents["b"].status, AgentStatus::Error);
+            let b = &inner.meta.agents["b"];
+            assert_eq!(b.status, AgentStatus::Waiting);
+            assert!(b.parked_until.is_some_and(|t| t > Utc::now()));
+            assert_eq!(b.inbox.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), vec!["hello"]);
+            assert!(b.history.is_empty() && b.in_flight.is_empty());
+            assert!(inner.meta.status_detail.as_deref().is_some_and(|d| d.contains("usage limits to reset")));
             assert!(inner.events.iter().any(
                 |e| matches!(&e.body, EventBody::Log { kind: LogKind::Info, text } if text.contains("Add a fallback"))
             ));
         }
+        // When the limit has reset, the parked persona continues by itself.
+        std::fs::remove_file(&flag).unwrap();
+        orch.limits.clear(None);
+        session.lock().meta.agents.get_mut("b").unwrap().parked_until = Some(Utc::now() - chrono::Duration::seconds(1));
+        orch.resume_parked(&session);
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Idle);
+        {
+            let inner = session.lock();
+            let b = &inner.meta.agents["b"];
+            assert!(b.parked_until.is_none() && b.inbox.is_empty(), "b handled its message");
+            assert_eq!(b.history.len(), 1);
+            assert_eq!(b.history[0].incoming[0].content, "hello");
+        }
+        std::fs::write(&flag, "").unwrap();
 
         // Once the limit resets, the persona is back on its primary.
         std::fs::remove_file(&flag).unwrap();

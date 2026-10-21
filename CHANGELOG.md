@@ -19,6 +19,7 @@ All notable changes to Chimera are listed here. The format follows
 - The Linux process guard also removes `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, `TMUX`, `TMUX_PANE` and
   `STY`, so agents cannot act on your desktop session or terminal multiplexer by default. The docs now say
   what the guard and the deny lists do and do not cover.
+- Updated rustls, rustls-webpki and webpki-root-certs to fix six advisories reported by `cargo audit`.
 
 ### Changed
 - A runtime in `chimera.yaml` with a built-in name is merged key by key over the built-in definition instead
@@ -26,6 +27,15 @@ All notable changes to Chimera are listed here. The format follows
 - `prompt_llm` keys in `chimera.yaml` are all optional.
 
 ### Fixed
+- Live session views no longer miss events: each event carries its sequence number as the SSE id, a
+  reconnecting browser (or TUI) only receives what it missed, and a client that falls behind the server's
+  buffer gets the missed events re-sent instead of silently losing them. The end of the history replay is
+  signalled by the server (`replay_done`) instead of a 400 ms timer, and the session page shows
+  "reconnecting…" while the connection is down. `/api/sessions/{id}/events` takes `?after=`.
+- A message sent while a session is winding down (after `<final>` or Cancel, while turns still stop) is no
+  longer dropped: it is delivered once the session has stopped and starts a new round.
+- A persona whose every runtime/model is rate limited now waits for the earliest reset and then continues,
+  instead of failing the turn and losing its messages.
 - A persona whose runtime does not exist no longer leaves the session "running" forever; its turn fails
   with "unknown runtime". Saving a team or starting a session with an unknown runtime is now rejected.
 - A turn that crashes is finished as a failed turn instead of leaving the persona stuck.
@@ -35,8 +45,8 @@ All notable changes to Chimera are listed here. The format follows
   persona's inbox, and messages in flight are saved so they are restored after a crash.
 - Usage-limit messages with absurd reset times ("try again in 99999999999999999 days") no longer crash the turn.
 
-### Security
-- Updated rustls, rustls-webpki and webpki-root-certs to fix six advisories reported by `cargo audit`.
+### Removed
+- The `tokio-stream` dependency.
 
 ## [0.1.1] - 2026-10-18
 

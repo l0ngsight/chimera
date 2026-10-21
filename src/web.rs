@@ -12,10 +12,9 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config::{ModelsSource, PromptLlmConfig, RuntimeSpec};
 use crate::decisions::DecisionsConfig;
@@ -434,6 +433,9 @@ async fn delete_session(State(st): State<Arc<AppState>>, Path(id): Path<String>)
 #[derive(Deserialize)]
 struct EventsQuery {
     agent: Option<String>,
+    /// Only events with a larger sequence number.
+    #[serde(default)]
+    after: u64,
 }
 
 async fn session_events(
@@ -442,21 +444,42 @@ async fn session_events(
     Query(q): Query<EventsQuery>,
 ) -> AppResult<Json<Vec<crate::session::Event>>> {
     let session = find_session(&st, &id)?;
-    Ok(Json(session.events_for(q.agent.as_deref())))
+    let mut events = session.events_for(q.agent.as_deref());
+    events.retain(|e| e.seq > q.after);
+    Ok(Json(events))
 }
 
-/// Server-sent events: replays the whole history, then streams live events.
+#[derive(Deserialize)]
+struct StreamQuery {
+    /// Resume after this sequence number (the `Last-Event-ID` header takes precedence).
+    #[serde(default)]
+    after: u64,
+}
+
+/// Server-sent events: the history (or what came after `Last-Event-ID` / `?after=`), a
+/// `replay_done` event, then live events. Each event carries its sequence number as the SSE id,
+/// so a reconnecting browser resumes where it stopped.
 async fn session_stream(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(q): Query<StreamQuery>,
+    headers: axum::http::HeaderMap,
 ) -> AppResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
     let session = find_session(&st, &id)?;
-    let (history, rx) = session.subscribe();
-    let last_seq = history.last().map(|e| e.seq).unwrap_or(0);
-    let replay = tokio_stream::iter(history);
-    let live = BroadcastStream::new(rx).filter_map(move |r| r.ok().filter(|e| e.seq > last_seq));
-    let stream =
-        replay.chain(live).map(|e| Ok(SseEvent::default().data(serde_json::to_string(&e).unwrap_or_default())));
+    let after = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(q.after);
+    let stream = session.event_stream(after).filter_map(|item| async move {
+        Some(Ok(match item {
+            crate::session::StreamItem::Event(e) => {
+                let data = serde_json::to_string(&e).ok()?;
+                SseEvent::default().id(e.seq.to_string()).data(data)
+            }
+            crate::session::StreamItem::ReplayDone => SseEvent::default().event("replay_done").data("{}"),
+        }))
+    });
     // End the stream when the server shuts down, otherwise graceful shutdown waits on it forever.
     let mut stop = st.shutdown.subscribe();
     let stream = futures::StreamExt::take_until(stream, async move {

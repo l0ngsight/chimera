@@ -424,6 +424,8 @@ async function sessionPage(id) {
   // Header
   const statusBadge = h('span', { class: 'badge ' + summary.status }, summary.status);
   const statusDetail = h('span', { class: 'muted small' }, summary.status_detail || '');
+  // Shown while the live connection to the server is down (EventSource retries by itself).
+  const connEl = h('span', { class: 'conn-lost hidden', role: 'status' }, 'reconnecting…');
   const cancelBtn = h('button', { class: 'danger', onclick: async () => { try { await api('POST', `/api/sessions/${id}/cancel`); } catch (e) { toast(e.message, true); } } }, 'Cancel');
   const deleteBtn = h('button', {
     class: 'danger', onclick: async () => {
@@ -614,7 +616,7 @@ async function sessionPage(id) {
   $app.append(h('div', { class: 'page full' },
     h('div', { class: 'session-head' },
       h('a', { href: '#/' }, '← Sessions'),
-      h('h1', {}, summary.title), statusBadge, statusDetail,
+      h('h1', {}, summary.title), statusBadge, statusDetail, connEl,
       h('span', { class: 'spacer' }),
       h('span', { class: 'badge plain' }, team.name), summary.dry_run ? h('span', { class: 'badge plain' }, 'dry run') : null,
       turnsEl, cancelBtn, deleteBtn),
@@ -631,13 +633,18 @@ async function sessionPage(id) {
           h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'To'), toSel, h('span', { class: 'spacer' }), h('span', { class: 'muted small' }, 'Ctrl+Enter to send'), sendBtn),
           msgInput)))));
 
-  // Live stream: replays history first, then live events.
+  // Live stream: the history first, then a `replay_done` event, then live events. Events carry
+  // their sequence number as the SSE id, so after a dropped connection the browser reconnects
+  // with Last-Event-ID and only receives what it missed.
   let live = false;
   const es = new EventSource(`/api/sessions/${id}/stream`);
-  es.onmessage = m => apply(JSON.parse(m.data));
+  es.onmessage = m => { try { apply(JSON.parse(m.data)); } catch (e) { console.warn('bad event', e); } };
+  es.addEventListener('replay_done', () => {
+    if (!live) { live = true; renderPanel(); }
+  });
+  es.onopen = () => connEl.classList.add('hidden');
+  es.onerror = () => connEl.classList.toggle('hidden', es.readyState === EventSource.OPEN);
   onLeave(() => es.close());
-  // The replay arrives in one burst; render the panel once afterwards.
-  setTimeout(() => { live = true; renderPanel(); }, 400);
   renderPanel();
 }
 

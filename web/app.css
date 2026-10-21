@@ -254,3 +254,4 @@ tr.clickable:hover td { background: var(--panel-2); }
 .fallback-row select { width: auto; flex: 1; min-width: 0; }
 .fallbacks > button { margin-top: 8px; }
 .fallback-line { font-size: 12.5px; margin: 8px 0; padding: 6px 10px; border-left: 3px solid var(--queued); background: var(--panel-2); border-radius: 4px; }
+.conn-lost { font-size: 12px; color: var(--queued); border: 1px solid var(--queued); border-radius: 999px; padding: 1px 8px; }
