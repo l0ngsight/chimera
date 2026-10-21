@@ -184,9 +184,11 @@ exceeded", …), Chimera:
    once the limit has reset.
 
 Switching to another CLI starts a fresh CLI session and replays the persona's earlier turns in the prompt. Each
-switch appears in the timeline (↯), and the graph shows what the persona currently runs on. A persona without a
-usable fallback fails the turn as before, with a hint to add one. `GET /api/limits` lists the current limits and
-`DELETE /api/limits?runtime=claude` forgets them, so primaries are tried again right away. Each runtime's
+switch appears in the timeline (↯), and the graph shows what the persona currently runs on. A persona with no
+usable fallback left waits instead: its messages stay in its inbox, the session shows "waiting for usage limits to
+reset", and the persona continues by itself when the earliest limit resets (with a hint to add a fallback if it has
+none). `GET /api/limits` lists the current limits and `DELETE /api/limits?runtime=claude` forgets them, so
+primaries are tried again on the next turn. Each runtime's
 `limit_patterns` (case-insensitive phrases searched in a failed turn's error) can be overridden in
 `chimera.yaml`.
 
