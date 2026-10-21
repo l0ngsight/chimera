@@ -102,6 +102,20 @@ impl Orchestrator {
         Ok(session)
     }
 
+    /// Runtimes a team uses (personas and their fallbacks) that are not configured, as
+    /// "persona: runtime" entries. Empty when everything resolves.
+    pub fn unknown_runtimes(&self, team: &Team) -> Vec<String> {
+        let mut out = vec![];
+        for p in &team.personas {
+            for level in p.at_levels() {
+                if !self.runtimes.contains_key(&level.runtime) {
+                    out.push(format!("{}: {}", p.id, level.runtime));
+                }
+            }
+        }
+        out
+    }
+
     /// Delivers a user message to a persona and (re)starts the scheduler.
     pub fn post_message(self: &Arc<Self>, session: &Arc<Session>, to: &str, content: &str) -> anyhow::Result<()> {
         if content.trim().is_empty() {
@@ -432,6 +446,7 @@ impl Orchestrator {
         let agent = inner.meta.agents.get_mut(&persona.id).expect("agent exists");
         let incoming = std::mem::take(&mut agent.inbox);
         let notes = std::mem::take(&mut agent.notes);
+        agent.in_flight = incoming.clone();
         agent.status = AgentStatus::Running;
         agent.turns += 1;
 
@@ -451,6 +466,7 @@ impl Orchestrator {
         session.emit_locked(inner, Some(&persona.id), EventBody::AgentStatus { status: AgentStatus::Running });
         session.emit_locked(inner, Some(&persona.id), EventBody::TurnStart { turn });
         session.emit_locked(inner, Some(&persona.id), EventBody::Log { kind: LogKind::Prompt, text: prompt.clone() });
+        inner.save(&session.dir);
 
         let cancel = inner.cancel.subscribe();
         let workdir = inner.meta.workdir.clone();
@@ -458,7 +474,8 @@ impl Orchestrator {
         let task = inner.meta.task.clone();
         let session = session.clone();
         let orch = self.clone();
-        tokio::spawn(async move {
+        let recovery = (session.clone(), persona.clone(), turn, incoming.clone(), notes.clone());
+        let work = tokio::spawn(async move {
             let started = Instant::now();
             let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogLine>();
             let fwd_session = session.clone();
@@ -474,10 +491,14 @@ impl Orchestrator {
                 None => persona,
             };
             let output = match spec {
-                None => TurnOutput {
-                    error: Some(format!("unknown runtime '{runtime_name}' (check chimera.yaml)")),
-                    ..Default::default()
-                },
+                None => {
+                    // Close the log channel, or the forwarder (and so the turn) never finishes.
+                    drop(log_tx);
+                    TurnOutput {
+                        error: Some(format!("unknown runtime '{runtime_name}' (check chimera.yaml)")),
+                        ..Default::default()
+                    }
+                }
                 Some(spec) if spec.kind == RuntimeKind::Mock => {
                     run_mock(&session, &team, &persona, &task, &workdir, &incoming, log_tx, cancel).await
                 }
@@ -507,7 +528,25 @@ impl Orchestrator {
                 return;
             }
             let routed = orch.route_output(&session, &team, &persona, &output).await;
-            complete_turn(&session, &persona, turn, incoming, output, routed, elapsed);
+            complete_turn(&session, &persona, turn, incoming, notes, output, routed, elapsed);
+        });
+        // If the turn task panics, finish the turn as a failure so the persona does not stay
+        // "running" forever and the scheduler can settle.
+        tokio::spawn(async move {
+            let Err(err) = work.await else { return };
+            if !err.is_panic() {
+                return;
+            }
+            let payload = err.into_panic();
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            let (session, persona, turn, incoming, notes) = recovery;
+            tracing::error!(session = %session.id, persona = %persona.id, "turn crashed: {msg}");
+            let output = TurnOutput { error: Some(format!("chimera: the turn crashed: {msg}")), ..Default::default() };
+            complete_turn(&session, &persona, turn, incoming, notes, output, Routed::default(), Duration::ZERO);
         });
     }
 
@@ -596,6 +635,7 @@ impl Orchestrator {
         let agent = inner.meta.agents.get_mut(id).expect("agent exists");
         agent.inbox.splice(0..0, incoming.iter().cloned());
         agent.notes.splice(0..0, notes.iter().cloned());
+        agent.in_flight.clear();
         agent.status = AgentStatus::Queued;
         session.emit_locked(&mut inner, Some(id), EventBody::AgentStatus { status: AgentStatus::Queued });
         inner.running.remove(id);
@@ -671,11 +711,13 @@ fn or_default(model: &str) -> &str {
 }
 
 /// Records a finished turn and routes the messages it produced.
+#[allow(clippy::too_many_arguments)]
 fn complete_turn(
     session: &Arc<Session>,
     persona: &Persona,
     turn: u32,
     incoming: Vec<InboxMessage>,
+    taken_notes: Vec<String>,
     output: TurnOutput,
     routed: Routed,
     elapsed: Duration,
@@ -685,6 +727,30 @@ fn complete_turn(
     let from = persona.id.as_str();
     let stopping = inner.stopping.is_some();
     let failed = output.error.is_some() && !stopping;
+
+    // The server is stopping and cut this turn short: as far as the team is concerned it did not
+    // happen. Its messages go back to the inbox and are handled when the session continues.
+    if output.error.is_some() && matches!(inner.stopping, Some((SessionStatus::Interrupted, _))) {
+        let error = output.error.clone();
+        session.emit_locked(
+            &mut inner,
+            Some(from),
+            EventBody::TurnEnd { turn, duration_ms: elapsed.as_millis() as u64, error },
+        );
+        inner.meta.round_turns = inner.meta.round_turns.saturating_sub(1);
+        let agent = inner.meta.agents.get_mut(from).expect("agent exists");
+        agent.inbox.splice(0..0, incoming);
+        agent.notes.splice(0..0, taken_notes);
+        agent.in_flight.clear();
+        agent.status = AgentStatus::Waiting;
+        session.emit_locked(&mut inner, Some(from), EventBody::AgentStatus { status: AgentStatus::Waiting });
+        inner.running.remove(from);
+        inner.save(&session.dir);
+        drop(inner);
+        session.wake.notify_one();
+        return;
+    }
+    drop(taken_notes);
 
     if let Some(err) = &output.error {
         session.emit_locked(&mut inner, Some(from), EventBody::Log { kind: LogKind::Error, text: err.clone() });
@@ -755,6 +821,7 @@ fn complete_turn(
 
     {
         let agent = inner.meta.agents.get_mut(from).expect("agent exists");
+        agent.in_flight.clear();
         agent.history.push(HistoryEntry { incoming, output: output.text.clone() });
         agent.notes.extend(notes);
         if output.error.is_none() && output.native_session.is_some() {
@@ -1388,6 +1455,132 @@ mod e2e_tests {
         let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .is_ok_and(|st| st.rsplit(')').next().is_some_and(|rest| !rest.trim_start().starts_with('Z')));
         assert!(!alive, "background process {pid} survived the turn");
+    }
+
+    fn sleepy_runtimes() -> BTreeMap<String, RuntimeSpec> {
+        let mut rts = builtin_runtimes();
+        rts.insert(
+            "sleepy".into(),
+            RuntimeSpec {
+                label: "sleepy".into(),
+                command: "sh".into(),
+                args: vec![ArgItem::One("-c".into()), ArgItem::One("cat > /dev/null; sleep 30".into())],
+                output: OutputFormat::Text,
+                ..rts["hermes"].clone()
+            },
+        );
+        rts
+    }
+
+    async fn wait_until_running(session: &Arc<Session>, id: &str) {
+        for _ in 0..100 {
+            if session.lock().running.contains(id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{id} never started");
+    }
+
+    /// A persona whose runtime does not exist fails its turn; it must not hang the session.
+    #[tokio::test]
+    async fn unknown_runtime_fails_the_turn_instead_of_hanging() {
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: nope}\n").unwrap();
+        let orch = orchestrator(builtin_runtimes());
+        assert_eq!(orch.unknown_runtimes(&team), vec!["a: nope".to_string()]);
+        let session = orch
+            .create_session(NewSession { team, task: "go".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(5), wait_until_settled(&session)).await;
+        assert_eq!(settled.expect("session hung"), SessionStatus::Idle);
+        let inner = session.lock();
+        assert_eq!(inner.meta.agents["a"].status, AgentStatus::Error);
+        assert!(inner.events.iter().any(
+            |e| matches!(&e.body, EventBody::TurnEnd { error: Some(err), .. } if err.contains("unknown runtime 'nope'"))
+        ));
+    }
+
+    /// Stopping the server mid-turn keeps the turn's messages for when the session continues.
+    #[tokio::test]
+    async fn interrupted_turns_keep_their_messages() {
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: sleepy}\n")
+                .unwrap();
+        let orch = orchestrator(sleepy_runtimes());
+        let session = orch
+            .create_session(NewSession { team, task: "the task".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        wait_until_running(&session, "a").await;
+        orch.interrupt(&session);
+        assert_eq!(wait_until_settled(&session).await, SessionStatus::Interrupted);
+        let inner = session.lock();
+        let a = &inner.meta.agents["a"];
+        assert_eq!(a.inbox.len(), 1, "the task is back in the inbox");
+        assert_eq!(a.inbox[0].content, "the task");
+        assert!(a.history.is_empty(), "the cut-short turn is not part of the history");
+        assert!(a.in_flight.is_empty());
+    }
+
+    /// If the server dies mid-turn, the messages that turn was handling are restored on load.
+    #[tokio::test]
+    async fn messages_of_a_turn_cut_by_a_crash_are_restored() {
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: sleepy}\n")
+                .unwrap();
+        let orch = orchestrator(sleepy_runtimes());
+        let session = orch
+            .create_session(NewSession { team, task: "the task".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        wait_until_running(&session, "a").await;
+        // What a restarted server would read from disk while the turn is still running.
+        let reloaded = Session::load(&session.dir).unwrap();
+        {
+            let inner = reloaded.lock();
+            assert_eq!(inner.meta.status, SessionStatus::Interrupted);
+            let a = &inner.meta.agents["a"];
+            assert_eq!(a.inbox.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), vec!["the task"]);
+            assert!(a.in_flight.is_empty());
+        }
+        orch.cancel(&session);
+        wait_until_settled(&session).await;
+    }
+
+    /// A process that escapes the turn's process group and keeps stderr open must not keep the
+    /// turn running.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn escaped_processes_holding_stderr_do_not_hang_the_turn() {
+        let mut rts = builtin_runtimes();
+        rts.insert(
+            "escapee".into(),
+            RuntimeSpec {
+                label: "escapee".into(),
+                command: "sh".into(),
+                args: vec![
+                    ArgItem::One("-c".into()),
+                    // `setsid` leaves the process group; the sleeper inherits stderr. The pause lets
+                    // it escape before the shell exits (otherwise the group kill still catches it).
+                    ArgItem::One(
+                        "cat > /dev/null; setsid sleep 8 > /dev/null & sleep 0.3; printf '<final>ok</final>'".into(),
+                    ),
+                ],
+                output: OutputFormat::Text,
+                ..rts["hermes"].clone()
+            },
+        );
+        let team: Team =
+            serde_yaml::from_str("id: t\nname: T\nentry: a\npersonas:\n  - {id: a, name: A, runtime: escapee}\n")
+                .unwrap();
+        let orch = orchestrator(rts);
+        let started = Instant::now();
+        let session = orch
+            .create_session(NewSession { team, task: "go".into(), title: None, workdir: None, dry_run: false })
+            .unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(7), wait_until_settled(&session)).await;
+        assert_eq!(settled.expect("turn hung on the escaped process"), SessionStatus::Completed);
+        assert!(started.elapsed() < Duration::from_secs(7));
+        assert_eq!(session.lock().meta.final_answer.as_deref(), Some("ok"));
     }
 
     #[tokio::test]

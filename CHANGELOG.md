@@ -6,6 +6,19 @@ All notable changes to Chimera are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A persona whose runtime does not exist no longer leaves the session "running" forever; its turn fails
+  with "unknown runtime". Saving a team or starting a session with an unknown runtime is now rejected.
+- A turn that crashes is finished as a failed turn instead of leaving the persona stuck.
+- A process that escaped the turn's process group (e.g. via `setsid`) and kept stderr open no longer keeps
+  the turn running.
+- Messages are no longer lost when the server stops mid-turn: the interrupted turn's messages go back to the
+  persona's inbox, and messages in flight are saved so they are restored after a crash.
+- Usage-limit messages with absurd reset times ("try again in 99999999999999999 days") no longer crash the turn.
+
+### Security
+- Updated rustls, rustls-webpki and webpki-root-certs to fix six advisories reported by `cargo audit`.
+
 ## [0.1.1] - 2026-10-18
 
 ### Added

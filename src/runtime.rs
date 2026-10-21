@@ -179,7 +179,7 @@ pub async fn run_process(
 
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_log = log.clone();
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         let mut tail = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -262,8 +262,16 @@ pub async fn run_process(
         Some(s) => s,
         None => tokio::time::timeout(Duration::from_secs(5), child.wait()).await.ok().and_then(Result::ok),
     };
-    let stderr_tail =
-        tokio::time::timeout(Duration::from_secs(2), stderr_task).await.ok().and_then(Result::ok).unwrap_or_default();
+    // A process that escaped the turn's process group (e.g. via `setsid`) can keep stderr open
+    // forever; stop reading after a moment, or the reader would keep the log channel (and so
+    // the turn) open.
+    let stderr_tail = match tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await {
+        Ok(Ok(tail)) => tail,
+        _ => {
+            stderr_task.abort();
+            String::new()
+        }
+    };
     let exit_code = status.and_then(|s| s.code());
 
     let mut out = parser.finish();

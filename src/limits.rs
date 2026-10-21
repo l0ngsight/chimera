@@ -40,9 +40,11 @@ fn tail(s: &str, max: usize) -> &str {
 /// Falls back to [`DEFAULT_COOLDOWN_MINUTES`] from `now`.
 pub fn reset_time(msg: &str, now: DateTime<Utc>) -> DateTime<Utc> {
     let lower = msg.to_lowercase();
-    let parsed =
-        epoch_after_pipe(&lower).or_else(|| relative(&lower).map(|d| now + d)).or_else(|| absolute(&lower, now));
-    let latest = now + Duration::days(MAX_COOLDOWN_DAYS);
+    // The message comes from agent output, so all arithmetic is checked: absurd values must not panic.
+    let parsed = epoch_after_pipe(&lower)
+        .or_else(|| relative(&lower).and_then(|d| now.checked_add_signed(d)))
+        .or_else(|| absolute(&lower, now));
+    let latest = now.checked_add_signed(Duration::days(MAX_COOLDOWN_DAYS)).unwrap_or(now);
     match parsed {
         Some(t) if t > now => t.min(latest),
         // A reset in the past (clock skew, stale message): retry after a short pause.
@@ -69,11 +71,14 @@ fn relative(s: &str) -> Option<Duration> {
         .iter()
         .filter_map(|k| s.find(k).map(|i| i + k.len()))
         .min()?;
+    let max = Duration::days(MAX_COOLDOWN_DAYS);
     let mut total = Duration::zero();
     let mut found = false;
     let mut tokens = tokenize(&s[start..]).into_iter().peekable();
     while let Some(tok) = tokens.next() {
-        let Ok(n) = tok.parse::<f64>() else {
+        let Ok(n) =
+            tok.parse::<f64>().map_err(|_| ()).and_then(|n| if n.is_finite() && n >= 0.0 { Ok(n) } else { Err(()) })
+        else {
             if matches!(tok.as_str(), "and" | "about" | "approximately" | "~") {
                 continue;
             }
@@ -88,7 +93,9 @@ fn relative(s: &str) -> Option<Duration> {
             "ms" | "millisecond" | "milliseconds" => 0.001,
             _ => break,
         };
-        total += Duration::milliseconds((n * secs * 1000.0) as i64);
+        // Anything beyond the cap is clamped later anyway; capping here keeps the sum in range.
+        let ms = (n * secs * 1000.0).min(max.num_milliseconds() as f64);
+        total = total.checked_add(&Duration::milliseconds(ms as i64)).unwrap_or(max).min(max);
         found = true;
     }
     found.then_some(total)
@@ -254,6 +261,24 @@ mod tests {
             ..Default::default()
         };
         assert!(detect(&rts["claude"], &out).is_some());
+    }
+
+    /// Limit messages come from agent output: absurd values are clamped, never a panic.
+    #[test]
+    fn absurd_reset_times_are_clamped() {
+        let now = Utc::now();
+        let cap = now + Duration::days(MAX_COOLDOWN_DAYS);
+        for msg in [
+            "try again in 99999999999999999 days",
+            "try again in 99999999999999999 days 99999999999999999 hours",
+            "try again in 1e308 seconds",
+            "try again in inf days",
+            "try again in -5 minutes",
+            "usage limit reached|99999999999999999999",
+        ] {
+            let at = reset_time(msg, now);
+            assert!(at > now && at <= cap, "{msg}: {at}");
+        }
     }
 
     #[test]
