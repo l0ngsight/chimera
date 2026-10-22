@@ -74,6 +74,18 @@ jobs:
       - run: cargo build --locked --target x86_64-unknown-linux-musl
       - run: ./target/x86_64-unknown-linux-musl/debug/chimera --version
 
+  licenses:
+    name: Licences (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20
+      # Every dependency must be under a licence allowed in deny.toml. This depends only on
+      # Cargo.lock, so unlike `cargo audit` it cannot turn red without a change in this repository.
+      - run: cargo deny --locked check licenses
+
   package:
     name: Package for crates.io
     runs-on: ubuntu-latest

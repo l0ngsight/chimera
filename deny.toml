@@ -1,0 +1,27 @@
+# cargo-deny configuration. CI runs `cargo deny check licenses` (.github/workflows/ci.yml).
+# Advisories are checked separately by `cargo audit` (.github/workflows/audit.yml).
+# Docs: https://embarkstudios.github.io/cargo-deny/
+# By default cargo-deny checks the dependencies of every target platform, not only this machine's.
+
+[licenses]
+# Chimera is MIT-licensed and ships as a single binary, so every dependency must allow that.
+# Only permissive licences are allowed. For a dependency offered under several licences
+# ("MIT OR Apache-2.0"), one allowed choice is enough.
+# A new dependency under a licence missing here fails CI. Add it only after checking it is
+# permissive (no copyleft such as GPL, LGPL, MPL-only or AGPL).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # Mozilla's root certificate data (webpki-root-certs).
+    "CDLA-Permissive-2.0",
+]
+# Accept a crate's licence text only when it matches the SPDX licence almost exactly.
+confidence-threshold = 0.93
+
+[licenses.private]
+# Crates that are not published (none today) are not checked.
+ignore = true

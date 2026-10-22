@@ -19,7 +19,7 @@ Chimera is published on crates.io as [`chimera-ai`](https://crates.io/crates/chi
 | One-time GitHub and crates.io settings (below) | done 2026-10-18 |
 | Advisory check: `cargo audit` weekly and when dependencies change | done (`.github/workflows/audit.yml`) |
 | Dependency and action updates | done (Dependabot, `.github/dependabot.yml`) |
-| Dependency licence check (`cargo deny`) | to do |
+| Dependency licence check: `cargo deny check licenses` against the allow list in `deny.toml` | done (`.github/workflows/ci.yml`) |
 | Windows | not supported (agents and tests rely on `sh`; the process guard has no Windows backend) |
 
 ## One-time setup (clicks)
@@ -75,9 +75,10 @@ This lets the release workflow publish without any API token stored in GitHub.
    - **Block force pushes**
    - **Require a pull request before merging**. Set required approvals to `0` while you are the only
      maintainer.
-   - **Require status checks to pass**. Click **Add checks** and add the six CI jobs:
+   - **Require status checks to pass**. Click **Add checks** and add the seven CI jobs:
      `Format and clippy`, `Test (ubuntu-latest, stable)`, `Test (macos-latest, stable)`,
-     `Test (ubuntu-latest, 1.88)`, `Build (x86_64-unknown-linux-musl)` and `Package for crates.io`.
+     `Test (ubuntu-latest, 1.88)`, `Build (x86_64-unknown-linux-musl)`, `Licences (cargo deny)` and
+     `Package for crates.io`.
      Leave `cargo audit` out: a newly published advisory would then block every pull request.
 5. Click **Create**.
 
