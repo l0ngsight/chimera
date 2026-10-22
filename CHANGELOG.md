@@ -39,6 +39,7 @@ All notable changes to Chimera are listed here. The format follows
   - Warnings fail only the clippy job.
   - CI also builds the static Linux (musl) binary.
   - A weekly `cargo audit` checks for new advisories.
+  - `cargo deny` checks that every dependency uses a permissive licence listed in `deny.toml`.
   - Dependabot proposes dependency and action updates.
 - The release workflow can be re-run safely. An existing GitHub Release gets its binaries replaced. The
   crates.io step only publishes after a definite "not found", and stops on any other error.
