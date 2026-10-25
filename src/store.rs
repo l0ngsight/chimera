@@ -15,6 +15,7 @@ use crate::model::Team;
 pub const SAMPLE_TEAMS: &[(&str, &str)] = &[
     ("software-dev", include_str!("../teams/software-dev.yaml")),
     ("copilot-engineering-team", include_str!("../teams/copilot-engineering-team.yaml")),
+    ("product-company", include_str!("../teams/product-company.yaml")),
 ];
 
 /// Sample teams that were renamed: (old id, new id, old name, new name). An install that has the
@@ -225,6 +226,22 @@ mod tests {
         }
     }
 
+    /// The product company runs on Claude, and on Hermes and DeepSeek only as fallbacks.
+    #[test]
+    fn product_company_is_claude_first_with_hermes_and_deepseek_fallbacks() {
+        let (_, yaml) = super::SAMPLE_TEAMS.iter().find(|(id, _)| *id == "product-company").unwrap();
+        let team: crate::model::Team = serde_yaml::from_str(yaml).unwrap();
+        for p in &team.personas {
+            assert_eq!(p.runtime, "claude", "{}", p.id);
+            assert!(p.fallbacks.iter().any(|f| f.runtime == "hermes"), "{}: no Hermes fallback", p.id);
+            assert!(
+                p.fallbacks.iter().any(|f| f.runtime == "opencode" && f.model.starts_with("deepseek/")),
+                "{}: no DeepSeek fallback",
+                p.id
+            );
+        }
+    }
+
     #[test]
     fn renamed_sample_teams_keep_the_users_copy() {
         let dir = std::env::temp_dir().join(format!("chimera-teams-{}", uuid::Uuid::new_v4()));
@@ -238,15 +255,18 @@ mod tests {
             .replacen("max_parallel: 3", "max_parallel: 2", 1);
         std::fs::write(dir.join("scb-software-engineering.yaml"), old).unwrap();
 
-        let store = super::TeamStore::open(dir.clone()).unwrap();
-        let teams = store.list().unwrap();
+        // Other samples shipped since are offered too; only the renamed one matters here.
+        let copilot_teams = |store: &super::TeamStore| -> Vec<crate::model::Team> {
+            store.list().unwrap().into_iter().filter(|t| t.name.contains("Engineering Team")).collect()
+        };
+        let teams = copilot_teams(&super::TeamStore::open(dir.clone()).unwrap());
         assert_eq!(teams.len(), 1, "no duplicate: {:?}", teams.iter().map(|t| &t.id).collect::<Vec<_>>());
         assert_eq!(teams[0].id, "copilot-engineering-team");
         assert_eq!(teams[0].name, "Copilot Engineering Team");
         assert_eq!(teams[0].max_parallel, 2, "the user's edit is kept");
         assert!(!dir.join("scb-software-engineering.yaml").exists());
         // Stable on the next start.
-        assert_eq!(super::TeamStore::open(dir).unwrap().list().unwrap().len(), 1);
+        assert_eq!(copilot_teams(&super::TeamStore::open(dir).unwrap()).len(), 1);
     }
 
     #[test]
@@ -256,9 +276,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = super::TeamStore::open(dir.clone()).unwrap();
         let ids: Vec<String> = store.list().unwrap().into_iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec!["copilot-engineering-team"]);
+        assert_eq!(ids, vec!["copilot-engineering-team", "product-company"]);
         // Deleting a sample sticks across restarts.
         std::fs::remove_file(dir.join("copilot-engineering-team.yaml")).unwrap();
+        std::fs::remove_file(dir.join("product-company.yaml")).unwrap();
         assert!(super::TeamStore::open(dir.clone()).unwrap().list().unwrap().is_empty());
         // A fresh install gets every sample.
         let fresh = dir.join("fresh");

@@ -1478,8 +1478,8 @@ mod e2e_tests {
         // Every persona reachable from the lead took part.
         for (id, agent) in &inner.meta.agents {
             assert!(agent.turns > 0, "{id} never ran");
+            assert!(inner.meta.workdir.join(format!("chimera-mock/{id}.md")).exists(), "{id} wrote no note");
         }
-        assert!(inner.meta.workdir.join("chimera-mock/qa.md").exists());
         // Session state is persisted and reloadable.
         drop(inner);
         let reloaded = Session::load(&session.dir).unwrap();
