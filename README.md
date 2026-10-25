@@ -127,6 +127,36 @@ Copilot restricts file access to the workspace and the temp directory, and unatt
 `--allow-all-urls` or `--allow-url=…` to a persona's *Extra CLI arguments* if your policy permits network
 access from agents.
 
+### Physical Product Company
+
+A third sample, [`teams/product-company.yaml`](teams/product-company.yaml), runs a small business instead of a
+software project: a direct-to-consumer company selling a physical product made by a contract manufacturer in
+Asia. It takes pre-orders, starts production once the order book covers the factory's minimum order quantity,
+and ships each order directly from the country of manufacture. Give it a task such as *"Find a product we can
+launch for under $20k and get us to the first production run"*.
+
+| Persona | Runtime | Model | Effort | Fallbacks on usage limits |
+|---|---|---|---|---|
+| Claire, CEO (**entry**): strategy, stage-gates, approval queue | claude | opus | medium | hermes hermes-4-405b → opencode deepseek-v4-pro |
+| Nadia, Market Research: picks the product | claude | opus | high | opencode deepseek-v4-pro → hermes hermes-4-405b |
+| Lin, Sourcing & Manufacturing: finds the factory, drafts the agreement, QC plan | claude | opus | high | hermes hermes-4-405b → opencode deepseek-v4-pro |
+| Felix, Finance: unit economics, production threshold, cash plan | claude | sonnet | high | opencode deepseek-v4-pro → hermes hermes-4-405b |
+| Omar, Operations & Logistics: pre-orders, direct shipping, customs | claude | sonnet | high | opencode deepseek-v4-pro → hermes hermes-4-405b |
+| Ivo, CIO: domain, DNS and email, storefront, payments, help desk | claude | sonnet | high | opencode deepseek-v4-pro → hermes hermes-4-405b |
+| Mateo, Marketing: demand test, ads, creators, product placement | claude | sonnet | medium | hermes hermes-4-405b → opencode deepseek-v4-flash |
+| Cara, Customer Relations: feedback, returns, refunds | claude | haiku | medium | opencode deepseek-v4-flash → hermes hermes-4-405b |
+
+Claude is the primary for every persona; Hermes (`nousresearch/hermes-4-405b`) and DeepSeek (through opencode)
+take over when Claude reports a usage limit. Research- and judgement-heavy roles use Opus, building and
+analysis roles Sonnet, and high-volume support Haiku. The CEO talks to everyone, and the others talk to the
+teammates they hand work to (research ↔ sourcing, finance and marketing; sourcing ↔ operations; operations ↔
+CIO and customer relations; and so on); customer relations reports defects straight to sourcing (one-way).
+
+The agents research, plan and prepare (supplier shortlists, the draft manufacturing agreement, the storefront
+code, policies, campaigns) in the session workspace. They do not sign, pay, register or publish anything:
+every such step goes on `company/APPROVALS.md` with its cost and risk, and the CEO's final answer lists that
+queue for you. The personas need web access for research (Claude Code's web tools, or the fallback CLIs').
+
 Sample teams are written to `data/teams` once, also on existing installs when a new sample ships; deleting
 one is permanent (`data/teams/.samples` records which were offered).
 

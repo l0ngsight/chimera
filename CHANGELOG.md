@@ -6,6 +6,13 @@ All notable changes to Chimera are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A third sample team, **Physical Product Company** (`teams/product-company.yaml`): a CEO, market research,
+  sourcing & manufacturing, finance, operations & logistics, CIO, marketing and customer relations run a
+  direct-to-consumer company that takes pre-orders, has its product made in Asia once enough orders are in,
+  and ships directly from the factory's country. Claude models are primary, with Hermes and DeepSeek as
+  fallbacks. Existing installs receive it on the next start.
+
 ### Security
 - The HTTP API checks every request: the `Host` header must name this server (stops DNS rebinding), and
   requests that change something are refused when they come from a page of another origin (stops cross-site
